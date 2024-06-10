@@ -10,6 +10,7 @@
   "author": "pissang",
   "license": "MIT",
   "dependencies": {
+    "@petamoriken/float16": "^3.8.7",
     "@tensorflow/tfjs": "^4.20.0"
   },
   "devDependencies": {

@@ -123,7 +123,7 @@ export function parseTZA(buffer: ArrayBuffer): Map<string, HostTensor> {
 
     // Parse the offset to the tensor data
     const tensorOffset = viewReader.read(8);
-    const tensorData = input.subarray(
+    const tensorData = input.slice(
       tensorOffset,
       tensorOffset + tensorDesc.getByteSize()
     );
