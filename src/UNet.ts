@@ -11,7 +11,7 @@ function getTensorData(
     return new Float32Array(ubytes.buffer);
   }
   const float16Data = new Float16Array(buffer);
-  const float32Data = new Float32Array(float16Data.buffer);
+  const float32Data = new Float32Array(float16Data.length);
   for (let i = 0; i < float32Data.length; ++i) {
     float32Data[i] = float16Data[i];
   }
@@ -23,14 +23,12 @@ class UNet {
 
   constructor(private _tensors: Map<string, HostTensor>) {}
 
-  init() {}
-
   private _createConv(
     name: string,
     source: tfjs.SymbolicTensor,
     activation?: 'reLU'
   ) {
-    const unetWeightTensor = this._tensors.get(name + '.weights')!;
+    const unetWeightTensor = this._tensors.get(name + '.weight')!;
     const unetBiasTensor = this._tensors.get(name + '.bias')!;
     const weightTensor = tfjs.tensor(
       getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
@@ -44,6 +42,7 @@ class UNet {
     );
     // TODO whats the purpose of padded dims ?
     const convLayer = tfjs.layers.conv2d({
+      name,
       filters: unetWeightTensor.desc.dims[0],
       kernelSize: unetWeightTensor.desc.dims.slice(2, 4) as [number, number],
       useBias: false,
@@ -76,7 +75,7 @@ class UNet {
     // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/concat_conv_hwc.cpp#L29
     // dst = activation(conv(src2, weight2) + dst)
 
-    const { desc, data } = this._tensors.get(name + '.weights')!;
+    const { desc, data } = this._tensors.get(name + '.weight')!;
 
     // TODO what's the difference between weight1 and weight2
     const weightTensor = tfjs.tensor(
@@ -88,6 +87,7 @@ class UNet {
     // TODO addOp?
 
     const convLayer = tfjs.layers.conv2d({
+      name,
       filters: desc.dims[0],
       kernelSize: desc.dims.slice(2, 4) as [number, number],
       useBias: false,
@@ -139,7 +139,8 @@ class UNet {
     const channels = 3;
 
     // TODO input process transferFunc
-    const input = tfjs.input({ shape: [channels, 256, 256] });
+    // TODO input shape
+    const input = tfjs.input({ shape: [channels, 512, 512], dtype: 'float32' });
 
     const encConv0 = this._createConv('enc_conv0', input, 'reLU');
     const pool1 = this._createPooling(
@@ -172,14 +173,38 @@ class UNet {
     const decConv1b = this._createConv('dec_conv1b', decConv1a, 'reLU');
     const decConv0 = this._createConv('dec_conv0', decConv1b, 'reLU');
 
-    const tfModel = (this._tfModel = tfjs.model({
+    this._tfModel = tfjs.model({
       inputs: [input],
       // TODO output process transferFunc
       outputs: decConv0
-    }));
+    });
   }
 
-  execute() {}
+  executeImageData(image: ImageData) {
+    const tensorData = new Float32Array((image.data.length / 4) * 3);
+    for (let i = 0; i < image.data.length; i += 4) {
+      tensorData[i / 4] = image.data[i] / 255;
+      tensorData[i / 4 + 1] = image.data[i + 1] / 255;
+      tensorData[i / 4 + 2] = image.data[i + 2] / 255;
+    }
+    const input = tfjs.tensor(
+      tensorData,
+      [3, image.width, image.height],
+      'float32'
+    );
+    const output = this._tfModel.predict(input) as tfjs.Tensor;
+    const outputData = output.dataSync();
+    output.dispose();
+    const outputImageData = new ImageData(image.width, image.height);
+    for (let i = 0; i < outputData.length; i += 3) {
+      outputImageData.data[i] = outputData[i] * 255;
+      outputImageData.data[i + 1] = outputData[i + 1] * 255;
+      outputImageData.data[i + 2] = outputData[i + 2] * 255;
+      // Keep alpha channel
+      outputImageData.data[i + 3] = image.data[i + 3];
+    }
+    return outputImageData;
+  }
 }
 
 export default UNet;
