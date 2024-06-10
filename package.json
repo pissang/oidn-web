@@ -1,0 +1,19 @@
+{
+  "name": "oidn-web",
+  "version": "1.0.0",
+  "description": "Run Open Image Denoiser on the Web",
+  "main": "index.js",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite dev"
+  },
+  "author": "pissang",
+  "license": "MIT",
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.20.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "vite": "^5.2.13"
+  }
+}
