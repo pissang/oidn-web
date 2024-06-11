@@ -1,4 +1,5 @@
 import * as tfjs from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-backend-webgpu';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
 
@@ -140,12 +141,15 @@ class UNet {
       .apply(source) as tfjs.SymbolicTensor;
   }
 
-  buildModel() {
+  buildModel(width: number, height: number) {
     const channels = 3;
 
     // TODO input process transferFunc
     // TODO input shape
-    const input = tfjs.input({ shape: [512, 512, channels], dtype: 'float32' });
+    const input = tfjs.input({
+      shape: [height, width, channels],
+      dtype: 'float32'
+    });
 
     const encConv0 = this._createConv('enc_conv0', input, 'relu');
     const pool1 = this._createPooling(
@@ -185,18 +189,26 @@ class UNet {
       // TODO output process transferFunc
       outputs: decConv0
     });
+
+    // tfjs.setBackend('webgl');
+  }
+
+  setWebGPUBackend() {
+    return tfjs.setBackend('webgpu');
   }
 
   executeImageData(image: ImageData) {
-    const tensorData = new Float32Array((image.data.length / 4) * 3);
-    for (let i = 0; i < image.data.length; i += 4) {
-      tensorData[i / 4] = image.data[i] / 255;
-      tensorData[i / 4 + 1] = image.data[i + 1] / 255;
-      tensorData[i / 4 + 2] = image.data[i + 2] / 255;
+    const rawData = image.data;
+    const tensorData = new Float32Array((rawData.length / 4) * 3);
+    for (let i = 0; i < rawData.length; i += 4) {
+      const i3 = (i / 4) * 3;
+      tensorData[i3] = rawData[i] / 255;
+      tensorData[i3 + 1] = rawData[i + 1] / 255;
+      tensorData[i3 + 2] = rawData[i + 2] / 255;
     }
     const input = tfjs.tensor(
       tensorData,
-      [image.height, image.width, 3],
+      [1, image.height, image.width, 3],
       'float32'
     );
     const output = this._tfModel.predict(input) as tfjs.Tensor;
@@ -204,11 +216,12 @@ class UNet {
     output.dispose();
     const outputImageData = new ImageData(image.width, image.height);
     for (let i = 0; i < outputData.length; i += 3) {
-      outputImageData.data[i] = outputData[i] * 255;
-      outputImageData.data[i + 1] = outputData[i + 1] * 255;
-      outputImageData.data[i + 2] = outputData[i + 2] * 255;
+      const i4 = (i / 3) * 4;
+      outputImageData.data[i4] = outputData[i] * 255;
+      outputImageData.data[i4 + 1] = outputData[i + 1] * 255;
+      outputImageData.data[i4 + 2] = outputData[i + 2] * 255;
       // Keep alpha channel
-      outputImageData.data[i + 3] = image.data[i + 3];
+      outputImageData.data[i4 + 3] = 255;
     }
     return outputImageData;
   }

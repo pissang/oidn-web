@@ -11,7 +11,8 @@
   "license": "MIT",
   "dependencies": {
     "@petamoriken/float16": "^3.8.7",
-    "@tensorflow/tfjs": "^4.20.0"
+    "@tensorflow/tfjs": "^4.20.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.20.0"
   },
   "devDependencies": {
     "typescript": "^5.4.5",
