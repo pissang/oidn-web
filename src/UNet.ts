@@ -18,6 +18,24 @@ function getTensorData(
   return float32Data;
 }
 
+function changeWeightShapes(weightData: Float32Array, dims: number[]) {
+  const [O, C, H, W] = dims;
+  const reorderedWeightData = new Float32Array(weightData.length);
+  for (let o = 0; o < O; ++o) {
+    for (let c = 0; c < C; ++c) {
+      for (let h = 0; h < H; ++h) {
+        for (let w = 0; w < W; ++w) {
+          // Change OCHW to HWCO
+          const idx = o * C * H * W + c * H * W + h * W + w;
+          const idx2 = h * W * C * O + w * C * O + c * O + o;
+          reorderedWeightData[idx2] = weightData[idx];
+        }
+      }
+    }
+  }
+  return reorderedWeightData;
+}
+
 class UNet {
   private _tfModel: tfjs.LayersModel;
 
@@ -26,18 +44,21 @@ class UNet {
   private _createConv(
     name: string,
     source: tfjs.SymbolicTensor,
-    activation?: 'reLU'
+    activation?: 'relu'
   ) {
     const unetWeightTensor = this._tensors.get(name + '.weight')!;
     const unetBiasTensor = this._tensors.get(name + '.bias')!;
+    const weightDims = unetWeightTensor.desc.dims;
     const weightTensor = tfjs.tensor(
-      getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
-      unetWeightTensor.desc.dims,
+      changeWeightShapes(
+        getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
+        weightDims
+      ),
+      [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
       'float32'
     );
-    const biasTensor = tfjs.tensor(
+    const biasTensor = tfjs.tensor1d(
       getTensorData(unetBiasTensor.data, unetBiasTensor.desc.dataType),
-      unetBiasTensor.desc.dims,
       'float32'
     );
     // TODO whats the purpose of padded dims ?
@@ -45,26 +66,14 @@ class UNet {
       name,
       filters: unetWeightTensor.desc.dims[0],
       kernelSize: unetWeightTensor.desc.dims.slice(2, 4) as [number, number],
-      useBias: false,
-      // NCHW
-      dataFormat: 'channelsFirst',
-      // Identity
-      activation: 'linear',
+      useBias: true,
+      activation,
       padding: 'same',
-      weights: [weightTensor],
+      weights: [weightTensor, biasTensor],
       trainable: false
     });
-    // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/concat_conv_hwc.cpp#L26
-    // dst = conv(src1, weight1) + bias
-    const out = tfjs.layers.add().apply([
-      // TODO
-      convLayer.apply(source) as tfjs.SymbolicTensor,
-      tfjs.input(biasTensor)
-    ]);
-    if (activation) {
-      return tfjs.layers[activation]().apply(out) as tfjs.SymbolicTensor;
-    }
-    return out as tfjs.SymbolicTensor;
+
+    return convLayer.apply(source) as tfjs.SymbolicTensor;
   }
 
   private _createConcatConv(
@@ -72,55 +81,51 @@ class UNet {
     source1: tfjs.SymbolicTensor,
     source2: tfjs.SymbolicTensor
   ) {
-    // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/concat_conv_hwc.cpp#L29
-    // dst = activation(conv(src2, weight2) + dst)
-
-    const { desc, data } = this._tensors.get(name + '.weight')!;
+    // const { desc, data } = this._tensors.get(name + '.weight')!;
 
     // TODO what's the difference between weight1 and weight2
-    const weightTensor = tfjs.tensor(
-      getTensorData(data, desc.dataType),
-      desc.dims,
-      'float32'
-    );
+    // const weightTensor = tfjs.tensor(
+    //   changeWeightShapes(getTensorData(data, desc.dataType), desc.dims),
+    //   [desc.dims[2], desc.dims[3], desc.dims[1], desc.dims[0]],
+    //   'float32'
+    // );
 
-    // TODO addOp?
+    // // TODO addOp?
 
-    const convLayer = tfjs.layers.conv2d({
+    // const convLayer = tfjs.layers.conv2d({
+    //   name,
+    //   filters: desc.dims[0],
+    //   kernelSize: desc.dims.slice(2, 4) as [number, number],
+    //   useBias: false,
+    //   // Identity
+    //   activation: 'linear',
+    //   padding: 'same',
+    //   weights: [weightTensor],
+    //   trainable: false
+    // });
+
+    //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
+    return this._createConv(
       name,
-      filters: desc.dims[0],
-      kernelSize: desc.dims.slice(2, 4) as [number, number],
-      useBias: false,
-      // NCHW
-      dataFormat: 'channelsFirst',
-      // Identity
-      activation: 'linear',
-      padding: 'same',
-      weights: [weightTensor],
-      trainable: false
-    });
-
-    return tfjs.layers
-      .reLU()
-      .apply(
-        tfjs.layers
-          .add()
-          .apply([
-            convLayer.apply(source2) as tfjs.SymbolicTensor,
-            this._createConv(name, source1)
-          ])
-      ) as tfjs.SymbolicTensor;
+      // Concat on the channel
+      tfjs.layers.concatenate({ trainable: false, axis: 3 }).apply([
+        // convLayer.apply(source2) as tfjs.SymbolicTensor,
+        source1,
+        source2
+      ]) as tfjs.SymbolicTensor,
+      'relu'
+    ) as tfjs.SymbolicTensor;
   }
 
   private _createPooling(source: tfjs.SymbolicTensor) {
     // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
     return tfjs.layers
       .maxPooling2d({
+        name: source.name + '/pooling',
         poolSize: [2, 2],
         strides: [2, 2],
-        // NCHW
-        dataFormat: 'channelsFirst',
-        padding: 'same'
+        padding: 'same',
+        trainable: false
       })
       .apply(source) as tfjs.SymbolicTensor;
   }
@@ -128,9 +133,9 @@ class UNet {
   private _addUpsamplingLayer(source: tfjs.SymbolicTensor) {
     return tfjs.layers
       .upSampling2d({
+        name: source.name + '/upsampling',
         size: [2, 2],
-        // NCHW
-        dataFormat: 'channelsFirst'
+        trainable: false
       })
       .apply(source) as tfjs.SymbolicTensor;
   }
@@ -140,38 +145,40 @@ class UNet {
 
     // TODO input process transferFunc
     // TODO input shape
-    const input = tfjs.input({ shape: [channels, 512, 512], dtype: 'float32' });
+    const input = tfjs.input({ shape: [512, 512, channels], dtype: 'float32' });
 
-    const encConv0 = this._createConv('enc_conv0', input, 'reLU');
+    const encConv0 = this._createConv('enc_conv0', input, 'relu');
     const pool1 = this._createPooling(
-      this._createConv('enc_conv1', encConv0, 'reLU')
+      this._createConv('enc_conv1', encConv0, 'relu')
     );
     const pool2 = this._createPooling(
-      this._createConv('enc_conv2', pool1, 'reLU')
+      this._createConv('enc_conv2', pool1, 'relu')
     );
     const pool3 = this._createPooling(
-      this._createConv('enc_conv3', pool2, 'reLU')
+      this._createConv('enc_conv3', pool2, 'relu')
     );
     const pool4 = this._createPooling(
-      this._createConv('enc_conv4', pool3, 'reLU')
+      this._createConv('enc_conv4', pool3, 'relu')
     );
-    const encConv5a = this._createConv('enc_conv5a', pool4, 'reLU');
-    const upsample4 = this._createConv('enc_conv5b', encConv5a, 'reLU');
+    const encConv5a = this._createConv('enc_conv5a', pool4, 'relu');
+    const upsample4 = this._addUpsamplingLayer(
+      this._createConv('enc_conv5b', encConv5a, 'relu')
+    );
     const decConv4a = this._createConcatConv('dec_conv4a', upsample4, pool3);
     const upsample3 = this._addUpsamplingLayer(
-      this._createConv('dec_conv4b', decConv4a, 'reLU')
+      this._createConv('dec_conv4b', decConv4a, 'relu')
     );
     const decConv3a = this._createConcatConv('dec_conv3a', upsample3, pool2);
     const upsample2 = this._addUpsamplingLayer(
-      this._createConv('dec_conv3b', decConv3a, 'reLU')
+      this._createConv('dec_conv3b', decConv3a, 'relu')
     );
     const decConv2a = this._createConcatConv('dec_conv2a', upsample2, pool1);
     const upsample1 = this._addUpsamplingLayer(
-      this._createConv('dec_conv2b', decConv2a, 'reLU')
+      this._createConv('dec_conv2b', decConv2a, 'relu')
     );
     const decConv1a = this._createConcatConv('dec_conv1a', upsample1, input);
-    const decConv1b = this._createConv('dec_conv1b', decConv1a, 'reLU');
-    const decConv0 = this._createConv('dec_conv0', decConv1b, 'reLU');
+    const decConv1b = this._createConv('dec_conv1b', decConv1a, 'relu');
+    const decConv0 = this._createConv('dec_conv0', decConv1b, 'relu');
 
     this._tfModel = tfjs.model({
       inputs: [input],
@@ -189,7 +196,7 @@ class UNet {
     }
     const input = tfjs.tensor(
       tensorData,
-      [3, image.width, image.height],
+      [image.height, image.width, 3],
       'float32'
     );
     const output = this._tfModel.predict(input) as tfjs.Tensor;
