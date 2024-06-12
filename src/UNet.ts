@@ -37,11 +37,30 @@ function changeWeightShapes(weightData: Float32Array, dims: number[]) {
   return reorderedWeightData;
 }
 
-class UNet {
-  private _tfModel: tfjs.LayersModel | undefined;
+function roundUp(a: number, b: number) {
+  return Math.ceil(a / b) * b;
+}
+// Returns the smallest integer larger than or equal to a which has remainder c when divided by b
+function roundUp2(a: number, b: number, c: number) {
+  return Math.ceil((a - c) / b) * b + c;
+}
 
-  private _width: number;
-  private _height: number;
+const receptiveField = 174; // receptive field in pixels
+// TODO metal is 32?
+const minTileAlignment = 1;
+
+const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
+
+class UNet {
+  private _tfModel!: tfjs.LayersModel;
+
+  // TODO calculate the tile size from memory size
+  // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
+  private _tileSize = 256;
+
+  private _tileOverlap = roundUp(receptiveField / 2, tileAlignment);
+
+  private _aux = false;
 
   constructor(private _tensors: Map<string, HostTensor>) {}
 
@@ -121,13 +140,14 @@ class UNet {
       .apply(source) as tfjs.SymbolicTensor;
   }
 
-  buildModel(width: number, height: number) {
-    const channels = 3;
+  buildModel(aux: boolean) {
+    const channels = 3 + (aux ? 6 : 0);
+    const tileSize = this._tileSize;
 
     // TODO input process transferFunc
     // TODO input shape
     const input = tfjs.input({
-      shape: [height, width, channels],
+      shape: [tileSize, tileSize, channels],
       dtype: 'float32'
     });
 
@@ -175,39 +195,174 @@ class UNet {
     return tfjs.setBackend('webgpu');
   }
 
-  executeImageData(image: ImageData) {
-    const width = image.width;
-    const height = image.height;
+  private _processImageData(
+    color: ImageData,
+    albedo?: ImageData,
+    normal?: ImageData
+  ) {
+    const rawData = color.data;
+    const pixelsCount = rawData.length / 4;
+    const channels = albedo ? 9 : 3;
+    const tensorData = new Float32Array(pixelsCount * channels);
 
-    const shapeChanged = this._width !== width || this._height !== height;
-    if (!this._tfModel || shapeChanged) {
-      // TODO needs to recreate?
-      this._tfModel?.dispose();
-      this.buildModel(width, height);
+    if ((albedo && !normal) || (normal && !albedo)) {
+      throw new Error('Normal map and albedo map are both required');
+    }
+    if (albedo && normal) {
+      if (
+        albedo.width !== normal.width ||
+        albedo.height !== normal.height ||
+        color.width !== albedo.width ||
+        color.height !== albedo.height
+      ) {
+        throw new Error('Image size mismatch');
+      }
     }
 
-    const rawData = image.data;
-    const tensorData = new Float32Array((rawData.length / 4) * 3);
     for (let i = 0; i < rawData.length; i += 4) {
-      const i3 = (i / 4) * 3;
-      tensorData[i3] = rawData[i] / 255;
-      tensorData[i3 + 1] = rawData[i + 1] / 255;
-      tensorData[i3 + 2] = rawData[i + 2] / 255;
+      const i2 = (i / 4) * channels;
+      tensorData[i2] = rawData[i] / 255;
+      tensorData[i2 + 1] = rawData[i + 1] / 255;
+      tensorData[i2 + 2] = rawData[i + 2] / 255;
+
+      if (albedo) {
+        const albedoData = albedo.data;
+        tensorData[i2 + 3] *= albedoData[i] / 255;
+        tensorData[i2 + 4] *= albedoData[i + 1] / 255;
+        tensorData[i2 + 5] *= albedoData[i + 2] / 255;
+      }
+      if (normal) {
+        const normalData = normal.data;
+        tensorData[i2 + 6] = normalData[i] / 255;
+        tensorData[i2 + 7] = normalData[i + 1] / 255;
+        tensorData[i2 + 8] = normalData[i + 2] / 255;
+      }
     }
-    const input = tfjs.tensor(tensorData, [1, height, width, 3], 'float32');
+
+    return tensorData;
+  }
+
+  private _readTile(
+    data: Float32Array,
+    channels: number,
+    x: number,
+    y: number,
+    tileSize: number
+  ) {
+    const tileData = new Float32Array(tileSize * tileSize * 3);
+    for (let k = 0; k < tileSize; k++) {
+      for (let l = 0; l < tileSize; l++) {
+        const x2 = x + l;
+        const y2 = y + k;
+        const i2 = (y2 * tileSize + x2) * channels;
+        const ix = (k * tileSize + l) * channels;
+
+        for (let i = 0; i < channels; i++) {
+          tileData[ix] = data[i2] / 255;
+        }
+      }
+    }
+    return tileData;
+  }
+
+  private _writeTile(
+    imageData: ImageData,
+    x: number,
+    y: number,
+    tileSize: number,
+    tileData: Float32Array
+  ) {
+    for (let k = 0; k < tileSize; k++) {
+      for (let l = 0; l < tileSize; l++) {
+        const x2 = x + l;
+        const y2 = y + k;
+        const i2 = (y2 * tileSize + x2) * 3;
+        const ix = (k * tileSize + l) * 3;
+
+        for (let i = 0; i < 3; i++) {
+          imageData.data[i2 + i] = Math.min(
+            Math.max(tileData[ix + i] * 255, 0),
+            255
+          );
+        }
+      }
+    }
+  }
+
+  private _executeTile(
+    inputData: Float32Array,
+    outputImageData: ImageData,
+    i: number,
+    j: number,
+    width: number,
+    height: number
+  ) {
+    const channels = this._aux ? 9 : 3;
+    const tileSize = this._tileSize;
+    const tileOverlap = this._tileOverlap;
+
+    let y0 = i > 0 ? i * (tileSize - tileOverlap) : 0;
+    let y1 = Math.min(y0 + tileSize, height);
+    y0 = y1 - tileSize;
+
+    let x0 = j > 0 ? j * (tileSize - tileOverlap) : 0;
+    let x1 = Math.min(x0 + tileSize, width);
+    x0 = x1 - tileSize;
+
+    const tileData = this._readTile(inputData, channels, x0, y0, tileSize);
+    const input = tfjs.tensor(
+      tileData,
+      [1, tileSize, tileSize, channels],
+      'float32'
+    );
     const output = this._tfModel!.predict(input) as tfjs.Tensor;
     const outputData = output.dataSync();
     output.dispose();
-    const outputImageData = new ImageData(image.width, image.height);
-    for (let i = 0; i < outputData.length; i += 3) {
-      const i4 = (i / 3) * 4;
-      outputImageData.data[i4] = outputData[i] * 255;
-      outputImageData.data[i4 + 1] = outputData[i + 1] * 255;
-      outputImageData.data[i4 + 2] = outputData[i + 2] * 255;
-      // Keep alpha channel
-      outputImageData.data[i4 + 3] = 255;
+
+    const ox0 = i > 0 ? x0 + tileOverlap : x0;
+    const oy0 = j > 0 ? y0 + tileOverlap : y0;
+    this._writeTile(
+      outputImageData,
+      ox0,
+      oy0,
+      tileSize - 2 * tileOverlap,
+      outputData as Float32Array
+    );
+  }
+
+  executeImageData(color: ImageData, albedo?: ImageData, normal?: ImageData) {
+    if (this._aux && (!albedo || !normal)) {
+      throw new Error('Normal map and albedo map are both required');
+    }
+
+    if (!this._aux) {
+      if (albedo || normal) {
+        throw new Error('Normal map and albedo map are not required');
+      }
+    }
+
+    const rawData = this._processImageData(color, albedo, normal);
+    const tileOverlap = this._tileOverlap;
+    const tileSize = this._tileSize + 2 * tileOverlap;
+    const width = color.width;
+    const height = color.height;
+    const tileCountH = Math.ceil(width / (tileSize - tileOverlap));
+    const tileCountW = Math.ceil(height / (tileSize - tileOverlap));
+
+    const outputImageData = new ImageData(width, height);
+    // TODO small width and height
+
+    // TODO tile pad?
+    for (let i = 0; i < tileCountH; i++) {
+      for (let j = 0; j < tileCountW; j++) {
+        this._executeTile(rawData, outputImageData, i, j, width, height);
+      }
     }
     return outputImageData;
+  }
+
+  dispose() {
+    this._tfModel.dispose();
   }
 }
 
