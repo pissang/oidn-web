@@ -56,9 +56,10 @@ class UNet {
 
   // TODO calculate the tile size from memory size
   // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
-  private _tileSize = 256;
+  private _tileSize = 512;
 
-  private _tileOverlap = roundUp(receptiveField / 2, tileAlignment);
+  // private _tileOverlap = roundUp(receptiveField / 2, tileAlignment);
+  private _tileOverlap = 0;
 
   private _aux = false;
 
@@ -141,8 +142,10 @@ class UNet {
   }
 
   buildModel(aux: boolean) {
+    this._aux = aux;
+
     const channels = 3 + (aux ? 6 : 0);
-    const tileSize = this._tileSize;
+    const tileSize = this._getTileSizeWithOverlap();
 
     // TODO input process transferFunc
     // TODO input shape
@@ -195,6 +198,10 @@ class UNet {
     return tfjs.setBackend('webgpu');
   }
 
+  private _getTileSizeWithOverlap() {
+    return this._tileSize + 2 * this._tileOverlap;
+  }
+
   private _processImageData(
     color: ImageData,
     albedo?: ImageData,
@@ -202,7 +209,7 @@ class UNet {
   ) {
     const rawData = color.data;
     const pixelsCount = rawData.length / 4;
-    const channels = albedo ? 9 : 3;
+    const channels = this._aux ? 9 : 3;
     const tensorData = new Float32Array(pixelsCount * channels);
 
     if ((albedo && !normal) || (normal && !albedo)) {
@@ -245,20 +252,18 @@ class UNet {
   private _readTile(
     data: Float32Array,
     channels: number,
-    x: number,
-    y: number,
+    tileX: number,
+    tileY: number,
     tileSize: number
   ) {
-    const tileData = new Float32Array(tileSize * tileSize * 3);
-    for (let k = 0; k < tileSize; k++) {
-      for (let l = 0; l < tileSize; l++) {
-        const x2 = x + l;
-        const y2 = y + k;
-        const i2 = (y2 * tileSize + x2) * channels;
-        const ix = (k * tileSize + l) * channels;
+    const tileData = new Float32Array(tileSize * tileSize * channels);
+    for (let y = 0; y < tileSize; y++) {
+      for (let x = 0; x < tileSize; x++) {
+        const i2 = ((y + tileY) * tileSize + (x + tileX)) * channels;
+        const i1 = (y * tileSize + x) * channels;
 
-        for (let i = 0; i < channels; i++) {
-          tileData[ix] = data[i2] / 255;
+        for (let c = 0; c < channels; c++) {
+          tileData[i1 + c] = data[i2 + c];
         }
       }
     }
@@ -267,24 +272,24 @@ class UNet {
 
   private _writeTile(
     imageData: ImageData,
-    x: number,
-    y: number,
+    tileX: number,
+    tileY: number,
     tileSize: number,
     tileData: Float32Array
   ) {
-    for (let k = 0; k < tileSize; k++) {
-      for (let l = 0; l < tileSize; l++) {
-        const x2 = x + l;
-        const y2 = y + k;
-        const i2 = (y2 * tileSize + x2) * 3;
-        const ix = (k * tileSize + l) * 3;
+    const outImageData = imageData.data;
+    for (let y = 0; y < tileSize; y++) {
+      for (let x = 0; x < tileSize; x++) {
+        const i2 = ((y + tileY) * tileSize + (x + tileX)) * 4;
+        const i1 = (y * tileSize + x) * 3;
 
-        for (let i = 0; i < 3; i++) {
-          imageData.data[i2 + i] = Math.min(
-            Math.max(tileData[ix + i] * 255, 0),
+        for (let c = 0; c < 3; c++) {
+          outImageData[i2 + c] = Math.min(
+            Math.max(tileData[i1 + c] * 255, 0),
             255
           );
         }
+        imageData.data[i2 + 3] = 255;
       }
     }
   }
@@ -298,8 +303,8 @@ class UNet {
     height: number
   ) {
     const channels = this._aux ? 9 : 3;
-    const tileSize = this._tileSize;
     const tileOverlap = this._tileOverlap;
+    const tileSize = this._getTileSizeWithOverlap();
 
     let y0 = i > 0 ? i * (tileSize - tileOverlap) : 0;
     let y1 = Math.min(y0 + tileSize, height);
@@ -321,6 +326,7 @@ class UNet {
 
     const ox0 = i > 0 ? x0 + tileOverlap : x0;
     const oy0 = j > 0 ? y0 + tileOverlap : y0;
+
     this._writeTile(
       outputImageData,
       ox0,
@@ -343,18 +349,18 @@ class UNet {
 
     const rawData = this._processImageData(color, albedo, normal);
     const tileOverlap = this._tileOverlap;
-    const tileSize = this._tileSize + 2 * tileOverlap;
+    const tileSize = this._getTileSizeWithOverlap();
     const width = color.width;
     const height = color.height;
-    const tileCountH = Math.ceil(width / (tileSize - tileOverlap));
-    const tileCountW = Math.ceil(height / (tileSize - tileOverlap));
+    const tileCountH = Math.ceil(height / (tileSize - tileOverlap * 2));
+    const tileCountW = Math.ceil(width / (tileSize - tileOverlap * 2));
 
     const outputImageData = new ImageData(width, height);
     // TODO small width and height
 
     // TODO tile pad?
-    for (let i = 0; i < tileCountH; i++) {
-      for (let j = 0; j < tileCountW; j++) {
+    for (let j = 0; j < tileCountH; j++) {
+      for (let i = 0; i < tileCountW; i++) {
         this._executeTile(rawData, outputImageData, i, j, width, height);
       }
     }
