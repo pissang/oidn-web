@@ -58,8 +58,9 @@ class UNet {
   // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
   private _tileSize = 512;
 
-  // private _tileOverlap = roundUp(receptiveField / 2, tileAlignment);
-  private _tileOverlap = 0;
+  private _tileOverlap = roundUp(receptiveField / 2, tileAlignment);
+  // TODO
+  // private _tileOverlap = 16;
 
   private _aux = false;
 
@@ -252,16 +253,16 @@ class UNet {
   private _readTile(
     data: Float32Array,
     channels: number,
-    tileX: number,
-    tileY: number,
-    tileSize: number,
+    srcTileX: number,
+    srcTileY: number,
+    srcTileSize: number,
     width: number
   ) {
-    const tileData = new Float32Array(tileSize * tileSize * channels);
-    for (let y = 0; y < tileSize; y++) {
-      for (let x = 0; x < tileSize; x++) {
-        const i2 = ((y + tileY) * width + (x + tileX)) * channels;
-        const i1 = (y * tileSize + x) * channels;
+    const tileData = new Float32Array(srcTileSize * srcTileSize * channels);
+    for (let y = 0; y < srcTileSize; y++) {
+      for (let x = 0; x < srcTileSize; x++) {
+        const i2 = ((y + srcTileY) * width + (x + srcTileX)) * channels;
+        const i1 = (y * srcTileSize + x) * channels;
 
         for (let c = 0; c < channels; c++) {
           tileData[i1 + c] = data[i2 + c];
@@ -273,20 +274,25 @@ class UNet {
 
   private _writeTile(
     imageData: ImageData,
-    tileX: number,
-    tileY: number,
-    tileSize: number,
-    tileData: Float32Array
+    srcTileX: number,
+    srcTileY: number,
+    dstTileX: number,
+    dstTileY: number,
+    srcTileSize: number,
+    dstTileSize: number,
+    srcTileData: Float32Array
   ) {
     const { data: outImageData, width, height } = imageData;
-    for (let y = 0; y < tileSize; y++) {
-      for (let x = 0; x < tileSize; x++) {
-        const i2 = ((y + tileY) * width + (x + tileX)) * 4;
-        const i1 = (y * tileSize + x) * 3;
+    const dx = dstTileX - srcTileX;
+    const dy = dstTileY - srcTileY;
+    for (let y = 0; y < dstTileSize; y++) {
+      for (let x = 0; x < dstTileSize; x++) {
+        const i1 = ((y + dy) * srcTileSize + x + dx) * 3;
+        const i2 = ((y + dstTileY) * width + (x + dstTileX)) * 4;
 
         for (let c = 0; c < 3; c++) {
           outImageData[i2 + c] = Math.min(
-            Math.max(tileData[i1 + c] * 255, 0),
+            Math.max(srcTileData[i1 + c] * 255, 0),
             255
           );
         }
@@ -305,41 +311,46 @@ class UNet {
   ) {
     const channels = this._aux ? 9 : 3;
     const tileOverlap = this._tileOverlap;
-    const tileSize = this._getTileSizeWithOverlap();
+    const srcTileSize = this._getTileSizeWithOverlap();
+    const dstTileSize = srcTileSize - 2 * tileOverlap;
 
-    let y0 = i > 0 ? i * (tileSize - tileOverlap) : 0;
-    let y1 = Math.min(y0 + tileSize, height);
-    y0 = y1 - tileSize;
+    let srcX0 = i > 0 ? i * dstTileSize - tileOverlap : 0;
+    let srcX1 = Math.min(srcX0 + srcTileSize, width);
+    srcX0 = srcX1 - srcTileSize;
 
-    let x0 = j > 0 ? j * (tileSize - tileOverlap) : 0;
-    let x1 = Math.min(x0 + tileSize, width);
-    x0 = x1 - tileSize;
+    let srcY0 = j > 0 ? j * dstTileSize - tileOverlap : 0;
+    let srcY1 = Math.min(srcY0 + srcTileSize, height);
+    srcY0 = srcY1 - srcTileSize;
 
     const tileData = this._readTile(
       inputData,
       channels,
-      x0,
-      y0,
-      tileSize,
+      srcX0,
+      srcY0,
+      srcTileSize,
       width
     );
     const input = tfjs.tensor(
       tileData,
-      [1, tileSize, tileSize, channels],
+      [1, srcTileSize, srcTileSize, channels],
       'float32'
     );
     const output = this._tfModel!.predict(input) as tfjs.Tensor;
     const outputData = output.dataSync();
     output.dispose();
+    input.dispose();
 
-    const ox0 = i > 0 ? x0 + tileOverlap : x0;
-    const oy0 = j > 0 ? y0 + tileOverlap : y0;
+    const dstX0 = i * dstTileSize;
+    const dstY0 = j * dstTileSize;
 
     this._writeTile(
       outputImageData,
-      ox0,
-      oy0,
-      tileSize - 2 * tileOverlap,
+      srcX0,
+      srcY0,
+      dstX0,
+      dstY0,
+      srcTileSize,
+      dstTileSize,
       outputData as Float32Array
     );
   }
