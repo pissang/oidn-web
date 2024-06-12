@@ -1,5 +1,5 @@
 import { initUNetWithModelPath } from '../src/main';
-import testImage from './test/test_1spp.png';
+import testImage from './test/test2.png';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
   '2d'

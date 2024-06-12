@@ -38,7 +38,10 @@ function changeWeightShapes(weightData: Float32Array, dims: number[]) {
 }
 
 class UNet {
-  private _tfModel: tfjs.LayersModel;
+  private _tfModel: tfjs.LayersModel | undefined;
+
+  private _width: number;
+  private _height: number;
 
   constructor(private _tensors: Map<string, HostTensor>) {}
 
@@ -82,29 +85,6 @@ class UNet {
     source1: tfjs.SymbolicTensor,
     source2: tfjs.SymbolicTensor
   ) {
-    // const { desc, data } = this._tensors.get(name + '.weight')!;
-
-    // TODO what's the difference between weight1 and weight2
-    // const weightTensor = tfjs.tensor(
-    //   changeWeightShapes(getTensorData(data, desc.dataType), desc.dims),
-    //   [desc.dims[2], desc.dims[3], desc.dims[1], desc.dims[0]],
-    //   'float32'
-    // );
-
-    // // TODO addOp?
-
-    // const convLayer = tfjs.layers.conv2d({
-    //   name,
-    //   filters: desc.dims[0],
-    //   kernelSize: desc.dims.slice(2, 4) as [number, number],
-    //   useBias: false,
-    //   // Identity
-    //   activation: 'linear',
-    //   padding: 'same',
-    //   weights: [weightTensor],
-    //   trainable: false
-    // });
-
     //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
     return this._createConv(
       name,
@@ -189,8 +169,6 @@ class UNet {
       // TODO output process transferFunc
       outputs: decConv0
     });
-
-    // tfjs.setBackend('webgl');
   }
 
   setWebGPUBackend() {
@@ -198,6 +176,16 @@ class UNet {
   }
 
   executeImageData(image: ImageData) {
+    const width = image.width;
+    const height = image.height;
+
+    const shapeChanged = this._width !== width || this._height !== height;
+    if (!this._tfModel || shapeChanged) {
+      // TODO needs to recreate?
+      this._tfModel?.dispose();
+      this.buildModel(width, height);
+    }
+
     const rawData = image.data;
     const tensorData = new Float32Array((rawData.length / 4) * 3);
     for (let i = 0; i < rawData.length; i += 4) {
@@ -206,12 +194,8 @@ class UNet {
       tensorData[i3 + 1] = rawData[i + 1] / 255;
       tensorData[i3 + 2] = rawData[i + 2] / 255;
     }
-    const input = tfjs.tensor(
-      tensorData,
-      [1, image.height, image.width, 3],
-      'float32'
-    );
-    const output = this._tfModel.predict(input) as tfjs.Tensor;
+    const input = tfjs.tensor(tensorData, [1, height, width, 3], 'float32');
+    const output = this._tfModel!.predict(input) as tfjs.Tensor;
     const outputData = output.dataSync();
     output.dispose();
     const outputImageData = new ImageData(image.width, image.height);
