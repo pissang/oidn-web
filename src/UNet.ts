@@ -254,12 +254,13 @@ class UNet {
     channels: number,
     tileX: number,
     tileY: number,
-    tileSize: number
+    tileSize: number,
+    width: number
   ) {
     const tileData = new Float32Array(tileSize * tileSize * channels);
     for (let y = 0; y < tileSize; y++) {
       for (let x = 0; x < tileSize; x++) {
-        const i2 = ((y + tileY) * tileSize + (x + tileX)) * channels;
+        const i2 = ((y + tileY) * width + (x + tileX)) * channels;
         const i1 = (y * tileSize + x) * channels;
 
         for (let c = 0; c < channels; c++) {
@@ -277,10 +278,10 @@ class UNet {
     tileSize: number,
     tileData: Float32Array
   ) {
-    const outImageData = imageData.data;
+    const { data: outImageData, width, height } = imageData;
     for (let y = 0; y < tileSize; y++) {
       for (let x = 0; x < tileSize; x++) {
-        const i2 = ((y + tileY) * tileSize + (x + tileX)) * 4;
+        const i2 = ((y + tileY) * width + (x + tileX)) * 4;
         const i1 = (y * tileSize + x) * 3;
 
         for (let c = 0; c < 3; c++) {
@@ -314,7 +315,14 @@ class UNet {
     let x1 = Math.min(x0 + tileSize, width);
     x0 = x1 - tileSize;
 
-    const tileData = this._readTile(inputData, channels, x0, y0, tileSize);
+    const tileData = this._readTile(
+      inputData,
+      channels,
+      x0,
+      y0,
+      tileSize,
+      width
+    );
     const input = tfjs.tensor(
       tileData,
       [1, tileSize, tileSize, channels],
