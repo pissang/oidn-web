@@ -37,10 +37,10 @@ initUNetWithModelPath('../weights/rt_ldr_alb_nrm.tza', {
 
     rawCtx.clearRect(0, 0, w, h);
     rawCtx.drawImage(albedoImage, 0, 0);
-    const normData = rawCtx.getImageData(0, 0, w, h);
+    const albedoData = rawCtx.getImageData(0, 0, w, h);
     rawCtx.clearRect(0, 0, w, h);
     rawCtx.drawImage(normImage, 0, 0);
-    const albedoData = rawCtx.getImageData(0, 0, w, h);
+    const normData = rawCtx.getImageData(0, 0, w, h);
 
     rawCtx.clearRect(0, 0, w, h);
     rawCtx.drawImage(colorImage, 0, 0);
