@@ -23,9 +23,13 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
 
   const rawData = rawCtx.getImageData(0, 0, width, height);
   console.time('denoising');
-  const denoisedData = unet.executeImageData(rawData);
-  console.timeEnd('denoising');
-  denoisedCtx.putImageData(denoisedData, 0, 0);
+  unet
+    .executeImageData(rawData, undefined, undefined, (tileData, _, tile) => {
+      denoisedCtx.putImageData(tileData, tile.x, tile.y);
+    })
+    .then((denoisedData) => {
+      console.timeEnd('denoising');
+    });
 }
 
 initUNetFromModelPath('../weights/rt_ldr.tza', {

@@ -401,6 +401,7 @@ class UNet {
 
   private _executeTile(
     inputData: Float32Array,
+    outputTileData: ImageData | HDRImageData,
     outputImageData: ImageData | HDRImageData,
     i: number,
     j: number,
@@ -433,36 +434,52 @@ class UNet {
       'float32'
     );
     const output = this._tfModel!.predict(input) as tfjs.Tensor;
-    const outputData = output.dataSync();
+    const denoisedData = output.dataSync();
     output.dispose();
     input.dispose();
 
     const dstX0 = i * dstTileSize.width;
     const dstY0 = j * dstTileSize.height;
 
+    const srcTile = new Tile(
+      srcX0,
+      srcY0,
+      srcTileSize.width,
+      srcTileSize.height
+    );
     this._writeTile(
       outputImageData,
-      new Tile(srcX0, srcY0, srcTileSize.width, srcTileSize.width),
+      srcTile,
       new Tile(dstX0, dstY0, dstTileSize.width, dstTileSize.height),
-      outputData as Float32Array
+      denoisedData as Float32Array
     );
+
+    // Write tile for progressive rendering.
+    // TODO should write to tile first
+    for (let y = 0; y < dstTileSize.height; y++) {
+      for (let x = 0; x < dstTileSize.width; x++) {
+        const i1 = (y * dstTileSize.width + x) * 4;
+        const i2 = ((y + dstY0) * width + (x + dstX0)) * 4;
+
+        for (let c = 0; c < 4; c++) {
+          outputTileData.data[i1 + c] = outputImageData.data[i2 + c];
+        }
+      }
+    }
   }
 
-  executeImageData(
-    color: ImageData,
+  async executeImageData<T extends ImageData | HDRImageData>(
+    color: T,
     albedo?: ImageData,
-    normal?: ImageData
-  ): ImageData;
-  executeImageData(
-    color: HDRImageData,
-    albedo?: ImageData,
-    normal?: ImageData
-  ): HDRImageData;
-  executeImageData(
-    color: ImageData | HDRImageData,
-    albedo?: ImageData,
-    normal?: ImageData
-  ) {
+    normal?: ImageData,
+    onProgress?: (
+      tileData: T,
+      outputData: T,
+      tile: Tile,
+      currentIdx: number,
+      totalIdx: number
+    ) => void
+  ): Promise<T> {
     if (this._aux && (!albedo || !normal)) {
       throw new Error('Normal map and albedo map are both required');
     }
@@ -482,25 +499,61 @@ class UNet {
     const isHDR = isHDRImageData(color);
 
     const rawData = this._processImageData(color, albedo, normal);
-    const tileCountH = Math.ceil(height / this._tileHeight);
-    const tileCountW = Math.ceil(width / this._tileWidth);
+    const tileWidth = this._tileWidth;
+    const tileHeight = this._tileHeight;
+    const tileCountH = Math.ceil(height / tileHeight);
+    const tileCountW = Math.ceil(width / tileWidth);
 
-    const outputImageData = isHDR
-      ? {
-          data: new Float32Array(width * height * 4),
-          width,
-          height
-        }
-      : new ImageData(width, height);
+    function makeImageData(width: number, height: number) {
+      return isHDR
+        ? {
+            data: new Float32Array(width * height * 4),
+            width,
+            height
+          }
+        : new ImageData(width, height);
+    }
 
     // TODO tile pad?
     // TODO small width and height
-    for (let j = 0; j < tileCountH; j++) {
-      for (let i = 0; i < tileCountW; i++) {
-        this._executeTile(rawData, outputImageData, i, j, width, height);
-      }
-    }
-    return outputImageData;
+
+    return new Promise((resolve) => {
+      const outputImageData = makeImageData(width, height);
+      const outputTileData = makeImageData(tileWidth, tileHeight);
+
+      const executeTile = (i: number, j: number) => {
+        this._executeTile(
+          rawData,
+          outputTileData,
+          outputImageData,
+          i,
+          j,
+          width,
+          height
+        );
+        onProgress?.(
+          outputTileData as T,
+          outputImageData as T,
+          new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
+          i + j * tileCountW,
+          tileCountW * tileCountH
+        );
+
+        if (i + 1 < tileCountW || j + 1 < tileCountH) {
+          requestAnimationFrame(() => {
+            if (i + 1 < tileCountW) {
+              executeTile(i + 1, j);
+            } else if (j + 1 < tileCountH) {
+              executeTile(0, j + 1);
+            }
+          });
+        } else {
+          resolve(outputImageData as T);
+        }
+      };
+
+      executeTile(0, 0);
+    });
   }
 
   dispose() {
