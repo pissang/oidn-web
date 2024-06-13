@@ -104,7 +104,6 @@ function write_hdr_core(
 
   const header =
     '#?RADIANCE\n' +
-    '# Vector to 3D\n' +
     'FORMAT=32-bit_rle_rgbe\n' +
     'EXPOSURE=1.0\n' +
     '\n' +

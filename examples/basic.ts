@@ -1,4 +1,4 @@
-import { initUNetWithModelPath } from '../src/main';
+import { UNet, initUNetFromModelPath } from '../src/main';
 import testImage from './test/test_1spp.png';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
@@ -8,23 +8,34 @@ const denoisedCtx = (
   document.getElementById('denoised') as HTMLCanvasElement
 ).getContext('2d')!;
 
-initUNetWithModelPath('../weights/rt_ldr.tza', {
+function denoise(rawImage: HTMLImageElement, unet: UNet) {
+  const width = +(document.getElementById('width') as HTMLInputElement).value;
+  const height = +(document.getElementById('height') as HTMLInputElement).value;
+
+  rawCtx.canvas.width = width;
+  rawCtx.canvas.height = height;
+  denoisedCtx.canvas.width = width;
+  denoisedCtx.canvas.height = height;
+
+  rawCtx.drawImage(rawImage, 0, 0, width, height);
+
+  const rawData = rawCtx.getImageData(0, 0, width, height);
+  console.time('denoising');
+  const denoisedData = unet.executeImageData(rawData);
+  console.timeEnd('denoising');
+  denoisedCtx.putImageData(denoisedData, 0, 0);
+}
+
+initUNetFromModelPath('../weights/rt_ldr.tza', {
   aux: false
 }).then((unet) => {
   const rawImage = new Image();
   rawImage.src = testImage;
   rawImage.onload = () => {
-    rawCtx.canvas.width = rawImage.width;
-    rawCtx.canvas.height = rawImage.height;
-    denoisedCtx.canvas.width = rawImage.width;
-    denoisedCtx.canvas.height = rawImage.height;
-
-    rawCtx.drawImage(rawImage, 0, 0);
-
-    const rawData = rawCtx.getImageData(0, 0, rawImage.width, rawImage.height);
-    console.time('denoising');
-    const denoisedData = unet.executeImageData(rawData);
-    console.timeEnd('denoising');
-    denoisedCtx.putImageData(denoisedData, 0, 0);
+    denoise(rawImage, unet);
   };
+
+  document.getElementById('resize')!.addEventListener('click', () => {
+    denoise(rawImage, unet);
+  });
 });

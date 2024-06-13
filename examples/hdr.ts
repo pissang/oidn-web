@@ -1,4 +1,4 @@
-import { initUNetWithModelPath } from '../src/main';
+import { initUNetFromModelPath } from '../src/main';
 import testColor from './test/test.hdr';
 import testAlbedo from './test/test4_albedo.png';
 import testNorm from './test/test4_norm.png';
@@ -43,7 +43,7 @@ function loadImage(url: string) {
   });
 }
 
-initUNetWithModelPath('../weights/rt_ldr_alb_nrm.tza', {
+initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
   aux: true
 }).then((unet) => {
   Promise.all([
@@ -59,10 +59,10 @@ initUNetWithModelPath('../weights/rt_ldr_alb_nrm.tza', {
     denoisedCtx.canvas.height = h;
 
     rawCtx.clearRect(0, 0, w, h);
-    rawCtx.drawImage(albedoImage, 0, 0);
+    rawCtx.drawImage(albedoImage, 0, 0, w, h);
     const albedoData = rawCtx.getImageData(0, 0, w, h);
     rawCtx.clearRect(0, 0, w, h);
-    rawCtx.drawImage(normImage, 0, 0);
+    rawCtx.drawImage(normImage, 0, 0, w, h);
     const normData = rawCtx.getImageData(0, 0, w, h);
 
     console.time('denoising');
