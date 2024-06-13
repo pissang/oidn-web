@@ -61,7 +61,7 @@ function convertHDRDataToImageData(hdrData: {
   return new ImageData(newData, width, height);
 }
 
-initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
+initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', {
   aux: true
 }).then((unet) => {
   Promise.all([

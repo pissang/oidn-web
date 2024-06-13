@@ -2,7 +2,7 @@ import * as tfjs from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
-import { avgLogLum, hdrTransferFunc } from './process';
+import { avgLogLum, hdrTransferFunc, hdrTransferFuncInverse } from './process';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -368,7 +368,7 @@ class UNet {
             );
           }
         }
-        imageData.data[i2 + 3] = 255;
+        imageData.data[i2 + 3] = isHDR ? 1 : 255;
       }
     }
   }
@@ -450,7 +450,7 @@ class UNet {
     tileTensor.dispose();
 
     if (isHDR) {
-      denoisedData = hdrTransferFunc({
+      denoisedData = hdrTransferFuncInverse({
         data: denoisedData as Float32Array,
         channels: 3,
         inputScale
