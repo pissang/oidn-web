@@ -49,13 +49,6 @@ function aces(v: number) {
   return clamp((v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14));
 }
 
-function hdrToSRGB(x: number) {
-  if (x <= 0.0031308) {
-    return x * 12.92;
-  }
-  return 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
-}
-
 function convertHDRDataToImageData(hdrData: {
   data: Float32Array;
   width: number;
@@ -75,7 +68,7 @@ function convertHDRDataToImageData(hdrData: {
   return new ImageData(newData, width, height);
 }
 
-initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', {
+initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
   Promise.all([

@@ -19,7 +19,7 @@ function loadImage(url: string) {
   });
 }
 
-initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
+initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
   Promise.all([
@@ -45,6 +45,7 @@ initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
     rawCtx.drawImage(colorImage, 0, 0, w, h);
     const colorData = rawCtx.getImageData(0, 0, w, h);
     console.time('denoising');
+
     abortDenoising = unet.progressiveExecute({
       color: colorData,
       albedo: albedoData,

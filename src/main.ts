@@ -1,35 +1,40 @@
+import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
 import { parseTZA } from './tza';
 import UNet from './UNet';
+import { initWebGPUBackend } from './backend';
 
 export { parseTZA, UNet };
 
-export function initUNEtFromModelBuffer(
-  buffer: ArrayBuffer,
-  opts: {
+export async function initUNEtFromModelBuffer(
+  tzaBuffer: ArrayBuffer,
+  backend?: WebGPUBackend,
+  opts?: {
     aux?: boolean;
     hdr?: boolean;
   }
 ) {
-  const tensors = parseTZA(buffer);
-  const unet = new UNet(tensors, {
-    aux: opts.aux,
-    hdr: opts.hdr
-  });
-  return unet.setWebGPUBackend().then(() => {
-    return unet;
-  });
+  if (!backend) {
+    backend = await initWebGPUBackend();
+  }
+  const tensors = parseTZA(tzaBuffer);
+  const unet = new UNet(tensors, backend, opts);
+  return unet;
 }
 
-export function initUNetFromModelPath(
+export async function initUNetFromModelPath(
   modelPath: string,
-  opts: {
+  backend?: WebGPUBackend,
+  opts?: {
     aux?: boolean;
     hdr?: boolean;
   }
 ) {
+  if (!backend) {
+    backend = await initWebGPUBackend();
+  }
   return fetch(modelPath)
     .then((res) => res.arrayBuffer())
     .then((ab) => {
-      return initUNEtFromModelBuffer(ab, opts);
+      return initUNEtFromModelBuffer(ab, backend, opts);
     });
 }

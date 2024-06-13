@@ -1,8 +1,16 @@
-import * as tfjs from '@tensorflow/tfjs';
-import '@tensorflow/tfjs-backend-webgpu';
+import * as tfjs from '@tensorflow/tfjs-core';
+import {
+  LayersModel,
+  SymbolicTensor,
+  layers,
+  input as tfInput,
+  model as tfModel
+} from '@tensorflow/tfjs-layers';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
 import { avgLogLum, hdrTransferFunc, hdrTransferFuncInverse } from './process';
+import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
+import { profileAndLogKernelCode } from './helper';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -74,7 +82,7 @@ const tileAlignment = 16; // required spatial alignment in pixels (padding may b
 const maxTileSize = 512;
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
 class UNet {
-  private _tfModel: tfjs.LayersModel | undefined;
+  private _tfModel: LayersModel | undefined;
 
   // TODO calculate the tile size from memory size
   // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
@@ -89,10 +97,11 @@ class UNet {
 
   constructor(
     private _tensors: Map<string, HostTensor>,
+    private _backend?: WebGPUBackend,
     opts: {
       aux?: boolean;
       hdr?: boolean;
-    }
+    } = {}
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
@@ -100,7 +109,7 @@ class UNet {
 
   private _createConv(
     name: string,
-    source: tfjs.SymbolicTensor,
+    source: SymbolicTensor,
     activation?: 'relu'
   ) {
     const unetWeightTensor = this._tensors.get(name + '.weight')!;
@@ -119,7 +128,7 @@ class UNet {
       'float32'
     );
     // TODO whats the purpose of padded dims ?
-    const convLayer = tfjs.layers.conv2d({
+    const convLayer = layers.conv2d({
       name,
       filters: unetWeightTensor.desc.dims[0],
       kernelSize: unetWeightTensor.desc.dims.slice(2, 4) as [number, number],
@@ -130,30 +139,30 @@ class UNet {
       trainable: false
     });
 
-    return convLayer.apply(source) as tfjs.SymbolicTensor;
+    return convLayer.apply(source) as SymbolicTensor;
   }
 
   private _createConcatConv(
     name: string,
-    source1: tfjs.SymbolicTensor,
-    source2: tfjs.SymbolicTensor
+    source1: SymbolicTensor,
+    source2: SymbolicTensor
   ) {
     //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
     return this._createConv(
       name,
       // Concat on the channel
-      tfjs.layers.concatenate({ trainable: false, axis: 3 }).apply([
-        // convLayer.apply(source2) as tfjs.SymbolicTensor,
+      layers.concatenate({ trainable: false, axis: 3 }).apply([
+        // convLayer.apply(source2) as SymbolicTensor,
         source1,
         source2
-      ]) as tfjs.SymbolicTensor,
+      ]) as SymbolicTensor,
       'relu'
-    ) as tfjs.SymbolicTensor;
+    ) as SymbolicTensor;
   }
 
-  private _createPooling(source: tfjs.SymbolicTensor) {
+  private _createPooling(source: SymbolicTensor) {
     // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
-    return tfjs.layers
+    return layers
       .maxPooling2d({
         name: source.name + '/pooling',
         poolSize: [2, 2],
@@ -161,17 +170,17 @@ class UNet {
         padding: 'same',
         trainable: false
       })
-      .apply(source) as tfjs.SymbolicTensor;
+      .apply(source) as SymbolicTensor;
   }
 
-  private _addUpsamplingLayer(source: tfjs.SymbolicTensor) {
-    return tfjs.layers
+  private _addUpsamplingLayer(source: SymbolicTensor) {
+    return layers
       .upSampling2d({
         name: source.name + '/upsampling',
         size: [2, 2],
         trainable: false
       })
-      .apply(source) as tfjs.SymbolicTensor;
+      .apply(source) as SymbolicTensor;
   }
 
   buildModel() {
@@ -181,7 +190,7 @@ class UNet {
 
     // TODO input process transferFunc
     // TODO input shape
-    const input = tfjs.input({
+    const input = tfInput({
       shape: [tileSize.height, tileSize.width, channels],
       dtype: 'float32'
     });
@@ -219,15 +228,11 @@ class UNet {
     const decConv1b = this._createConv('dec_conv1b', decConv1a, 'relu');
     const decConv0 = this._createConv('dec_conv0', decConv1b, 'relu');
 
-    this._tfModel = tfjs.model({
+    this._tfModel = tfModel({
       inputs: [input],
       // TODO output process transferFunc
       outputs: decConv0
     });
-  }
-
-  setWebGPUBackend() {
-    return tfjs.setBackend('webgpu');
   }
 
   private _updateModel(width: number, height: number) {
@@ -560,15 +565,17 @@ class UNet {
       if (aborted) {
         return;
       }
-      this._executeTile(
-        rawData,
-        outputTileData,
-        outputImageData,
-        i,
-        j,
-        width,
-        height
-      );
+      profileAndLogKernelCode(() => {
+        this._executeTile(
+          rawData,
+          outputTileData,
+          outputImageData,
+          i,
+          j,
+          width,
+          height
+        );
+      }, true);
       progress?.(
         outputTileData as T,
         outputImageData as T,
