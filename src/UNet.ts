@@ -37,12 +37,22 @@ function changeWeightShapes(weightData: Float32Array, dims: number[]) {
   return reorderedWeightData;
 }
 
+interface HDRImageData {
+  data: Float32Array;
+  width: number;
+  height: number;
+}
+
 function roundUp(a: number, b: number) {
   return Math.ceil(a / b) * b;
 }
 // Returns the smallest integer larger than or equal to a which has remainder c when divided by b
 function roundUp2(a: number, b: number, c: number) {
   return Math.ceil((a - c) / b) * b + c;
+}
+
+function isHDRImageData(data: ImageData | HDRImageData): data is HDRImageData {
+  return data.data instanceof Float32Array;
 }
 
 const receptiveField = 174; // receptive field in pixels
@@ -204,7 +214,7 @@ class UNet {
   }
 
   private _processImageData(
-    color: ImageData,
+    color: ImageData | HDRImageData,
     albedo?: ImageData,
     normal?: ImageData
   ) {
@@ -227,23 +237,24 @@ class UNet {
       }
     }
 
+    const albedoData = albedo?.data;
+    const normalData = normal?.data;
+    const isHDR = isHDRImageData(color);
     for (let i = 0; i < rawData.length; i += 4) {
       const i2 = (i / 4) * channels;
-      tensorData[i2] = rawData[i] / 255;
-      tensorData[i2 + 1] = rawData[i + 1] / 255;
-      tensorData[i2 + 2] = rawData[i + 2] / 255;
 
-      if (albedo) {
-        const albedoData = albedo.data;
-        tensorData[i2 + 3] *= albedoData[i] / 255;
-        tensorData[i2 + 4] *= albedoData[i + 1] / 255;
-        tensorData[i2 + 5] *= albedoData[i + 2] / 255;
-      }
-      if (normal) {
-        const normalData = normal.data;
-        tensorData[i2 + 6] = normalData[i] / 255;
-        tensorData[i2 + 7] = normalData[i + 1] / 255;
-        tensorData[i2 + 8] = normalData[i + 2] / 255;
+      for (let c = 0; c < 3; c++) {
+        if (isHDR) {
+          tensorData[i2 + c] = rawData[i + c];
+        } else {
+          tensorData[i2 + c] = rawData[i + c] / 255;
+        }
+        if (albedoData) {
+          tensorData[i2 + c + 3] = albedoData[i + c] / 255;
+        }
+        if (normalData) {
+          tensorData[i2 + c + 6] = normalData[i + c] / 255;
+        }
       }
     }
 
@@ -273,7 +284,7 @@ class UNet {
   }
 
   private _writeTile(
-    imageData: ImageData,
+    imageData: ImageData | HDRImageData,
     srcTileX: number,
     srcTileY: number,
     dstTileX: number,
@@ -282,19 +293,24 @@ class UNet {
     dstTileSize: number,
     srcTileData: Float32Array
   ) {
-    const { data: outImageData, width, height } = imageData;
+    const { data: outImageData, width } = imageData;
     const dx = dstTileX - srcTileX;
     const dy = dstTileY - srcTileY;
+    const isHDR = isHDRImageData(imageData);
     for (let y = 0; y < dstTileSize; y++) {
       for (let x = 0; x < dstTileSize; x++) {
         const i1 = ((y + dy) * srcTileSize + x + dx) * 3;
         const i2 = ((y + dstTileY) * width + (x + dstTileX)) * 4;
 
         for (let c = 0; c < 3; c++) {
-          outImageData[i2 + c] = Math.min(
-            Math.max(srcTileData[i1 + c] * 255, 0),
-            255
-          );
+          if (isHDR) {
+            outImageData[i2 + c] = srcTileData[i1 + c];
+          } else {
+            outImageData[i2 + c] = Math.min(
+              Math.max(srcTileData[i1 + c] * 255, 0),
+              255
+            );
+          }
         }
         imageData.data[i2 + 3] = 255;
       }
@@ -303,7 +319,7 @@ class UNet {
 
   private _executeTile(
     inputData: Float32Array,
-    outputImageData: ImageData,
+    outputImageData: ImageData | HDRImageData,
     i: number,
     j: number,
     width: number,
@@ -355,7 +371,11 @@ class UNet {
     );
   }
 
-  executeImageData(color: ImageData, albedo?: ImageData, normal?: ImageData) {
+  executeImageData(
+    color: ImageData | HDRImageData,
+    albedo?: ImageData,
+    normal?: ImageData
+  ) {
     if (this._aux && (!albedo || !normal)) {
       throw new Error('Normal map and albedo map are both required');
     }
@@ -366,6 +386,10 @@ class UNet {
       }
     }
 
+    // TODO should fixed to be hdr when UNet is created.
+    // weights of hdr and ldr is different
+    const isHDR = isHDRImageData(color);
+
     const rawData = this._processImageData(color, albedo, normal);
     const tileOverlap = this._tileOverlap;
     const tileSize = this._getTileSizeWithOverlap();
@@ -374,10 +398,16 @@ class UNet {
     const tileCountH = Math.ceil(height / (tileSize - tileOverlap * 2));
     const tileCountW = Math.ceil(width / (tileSize - tileOverlap * 2));
 
-    const outputImageData = new ImageData(width, height);
-    // TODO small width and height
+    const outputImageData = isHDR
+      ? {
+          data: new Float32Array(width * height * 4),
+          width,
+          height
+        }
+      : new ImageData(width, height);
 
     // TODO tile pad?
+    // TODO small width and height
     for (let j = 0; j < tileCountH; j++) {
       for (let i = 0; i < tileCountW; i++) {
         this._executeTile(rawData, outputImageData, i, j, width, height);
