@@ -345,7 +345,8 @@ class UNet {
     imageData: ImageData | HDRImageData,
     srcTile: Tile,
     dstTile: Tile,
-    srcTileData: Float32Array
+    srcTileData: Float32Array,
+    srcWidth: number
   ) {
     const { data: outImageData, width } = imageData;
     const dx = dstTile.x - srcTile.x;
@@ -353,7 +354,7 @@ class UNet {
     const isHDR = isHDRImageData(imageData);
     for (let y = 0; y < dstTile.height; y++) {
       for (let x = 0; x < dstTile.width; x++) {
-        const i1 = ((y + dy) * srcTile.width + x + dx) * 3;
+        const i1 = ((y + dy) * srcWidth + x + dx) * 3;
         const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
 
         for (let c = 0; c < 3; c++) {
@@ -415,24 +416,20 @@ class UNet {
     // We need resize if input size is smaller than tile size. And is rounded up.
     if (needsResize) {
       const rawTileTensor = tileTensor;
-      tileTensor = tfjs.image.resizeBilinear(tileTensor, [
-        srcTileSize.height,
-        srcTileSize.width
-      ]);
+      tileTensor = tfjs.mirrorPad(
+        rawTileTensor,
+        [
+          [0, 0],
+          [0, srcTileSize.height - height],
+          [0, srcTileSize.width - width],
+          [0, 0]
+        ],
+        'reflect'
+      );
       rawTileTensor.dispose();
     }
 
-    let outputTensor = this._tfModel!.predict(tileTensor) as tfjs.Tensor;
-
-    // We need resize if input size is smaller than tile size. And is rounded up.
-    if (needsResize) {
-      const rawOutputTensor = outputTensor;
-      outputTensor = tfjs.image.resizeBilinear(outputTensor as tfjs.Tensor3D, [
-        height,
-        width
-      ]);
-      rawOutputTensor.dispose();
-    }
+    const outputTensor = this._tfModel!.predict(tileTensor) as tfjs.Tensor;
 
     const denoisedData = outputTensor.dataSync();
     outputTensor.dispose();
@@ -451,7 +448,8 @@ class UNet {
         Math.min(dstWidth, width),
         Math.min(dstHeight, height)
       ),
-      denoisedData as Float32Array
+      denoisedData as Float32Array,
+      srcTileSize.width
     );
 
     if (needsResize) {
