@@ -1,7 +1,4 @@
 import { initUNetFromModelPath } from '../src/main';
-import testColor from './test/test.hdr';
-import testAlbedo from './test/test4_albedo.png';
-import testNorm from './test/test4_norm.png';
 import { readHDR } from '../src/hdr';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
@@ -43,13 +40,34 @@ function loadImage(url: string) {
   });
 }
 
+let abortDenoising;
+
+function convertHDRDataToImageData(hdrData: {
+  data: Float32Array;
+  width: number;
+  height: number;
+}) {
+  const { data, width, height } = hdrData;
+  const newData = new Uint8ClampedArray(data.length);
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i] * 255;
+    const g = data[i + 1] * 255;
+    const b = data[i + 2] * 255;
+    newData[i + 0] = r;
+    newData[i + 1] = g;
+    newData[i + 2] = b;
+    newData[i + 3] = 255;
+  }
+  return new ImageData(newData, width, height);
+}
+
 initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
   aux: true
 }).then((unet) => {
   Promise.all([
-    loadHDR(testColor),
-    loadImage(testAlbedo),
-    loadImage(testNorm)
+    loadHDR('./test/test.hdr'),
+    loadImage('./test/test4_albedo.png'),
+    loadImage('./test/test4_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
     const w = colorData.width;
     const h = colorData.height;
@@ -65,9 +83,23 @@ initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
     rawCtx.drawImage(normImage, 0, 0, w, h);
     const normData = rawCtx.getImageData(0, 0, w, h);
 
+    rawCtx.putImageData(convertHDRDataToImageData(colorData), 0, 0);
+
     console.time('denoising');
-    const denoisedData = unet.executeImageData(colorData, albedoData, normData);
-    console.timeEnd('denoising');
-    denoisedCtx.putImageData(denoisedData, 0, 0);
+    abortDenoising = unet.progressiveExecute({
+      color: colorData,
+      albedo: albedoData,
+      normal: normData,
+      done() {
+        console.timeEnd('denoising');
+      },
+      progress(tileData, _, tile) {
+        denoisedCtx.putImageData(
+          convertHDRDataToImageData(tileData),
+          tile.x,
+          tile.y
+        );
+      }
+    });
   });
 });

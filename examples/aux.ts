@@ -1,7 +1,4 @@
 import { initUNetFromModelPath } from '../src/main';
-import testColor from './test/test4_color.png';
-import testAlbedo from './test/test4_albedo.png';
-import testNorm from './test/test4_norm.png';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
   '2d'
@@ -26,9 +23,9 @@ initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
   aux: true
 }).then((unet) => {
   Promise.all([
-    loadImage(testColor),
-    loadImage(testAlbedo),
-    loadImage(testNorm)
+    loadImage('./test/test4_color.png'),
+    loadImage('./test/test4_albedo.png'),
+    loadImage('./test/test4_norm.png')
   ]).then(([colorImage, albedoImage, normImage]) => {
     const w = colorImage.width;
     const h = colorImage.height;

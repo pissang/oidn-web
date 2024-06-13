@@ -2,6 +2,7 @@ import * as tfjs from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
+import { avgLogLum, hdrTransferFunc } from './process';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -407,6 +408,19 @@ class UNet {
     const needsResize =
       width < dstTileSize.width || height < dstTileSize.height;
 
+    let inputScale = 1;
+    if (isHDR) {
+      inputScale = avgLogLum({
+        data: tileData,
+        channels: 9
+      });
+      tileData = hdrTransferFunc({
+        data: tileData,
+        channels: 9,
+        inputScale
+      });
+    }
+
     let tileTensor = tfjs.tensor(
       tileData,
       [1, tileRawHeight, tileRawWidth, channels],
@@ -431,9 +445,17 @@ class UNet {
 
     const outputTensor = this._tfModel!.predict(tileTensor) as tfjs.Tensor;
 
-    const denoisedData = outputTensor.dataSync();
+    let denoisedData = outputTensor.dataSync();
     outputTensor.dispose();
     tileTensor.dispose();
+
+    if (isHDR) {
+      denoisedData = hdrTransferFunc({
+        data: denoisedData as Float32Array,
+        channels: 3,
+        inputScale
+      });
+    }
 
     const dstWidth = Math.min(dstTileSize.width, width);
     const dstHeight = Math.min(dstTileSize.height, height);
