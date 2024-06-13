@@ -42,6 +42,20 @@ function loadImage(url: string) {
 
 let abortDenoising;
 
+function clamp(v: number) {
+  return Math.min(1.0, Math.max(0.0, v));
+}
+function aces(v: number) {
+  return clamp((v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14));
+}
+
+function hdrToSRGB(x: number) {
+  if (x <= 0.0031308) {
+    return x * 12.92;
+  }
+  return 1.055 * Math.pow(x, 1 / 2.4) - 0.055;
+}
+
 function convertHDRDataToImageData(hdrData: {
   data: Float32Array;
   width: number;
@@ -50,9 +64,9 @@ function convertHDRDataToImageData(hdrData: {
   const { data, width, height } = hdrData;
   const newData = new Uint8ClampedArray(data.length);
   for (let i = 0; i < data.length; i += 4) {
-    const r = data[i] * 255;
-    const g = data[i + 1] * 255;
-    const b = data[i + 2] * 255;
+    const r = Math.sqrt(aces(data[i])) * 255;
+    const g = Math.sqrt(aces(data[i + 1])) * 255;
+    const b = Math.sqrt(aces(data[i + 2])) * 255;
     newData[i + 0] = r;
     newData[i + 1] = g;
     newData[i + 2] = b;
@@ -65,9 +79,9 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', {
   aux: true
 }).then((unet) => {
   Promise.all([
-    loadHDR('./test/test.hdr'),
-    loadImage('./test/test4_albedo.png'),
-    loadImage('./test/test4_norm.png')
+    loadHDR('./test/test5_color.hdr'),
+    loadImage('./test/test5_albedo.png'),
+    loadImage('./test/test5_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
     const w = colorData.width;
     const h = colorData.height;
