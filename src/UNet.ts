@@ -1,11 +1,17 @@
-import * as tfjs from '@tensorflow/tfjs-core';
+// import * as tfjs from '@tensorflow/tfjs-core';
+import type { Tensor, Tensor1D, Tensor4D } from '@tensorflow/tfjs-core';
+import type { SymbolicTensor } from '@tensorflow/tfjs-layers';
+import { tensor } from '@tensorflow/tfjs-core/dist/ops/tensor';
+import { tensor1d } from '@tensorflow/tfjs-core/dist/ops/tensor1d';
+import { mirrorPad } from '@tensorflow/tfjs-core/dist/ops/mirror_pad';
 import {
-  LayersModel,
-  SymbolicTensor,
-  layers,
-  input as tfInput,
-  model as tfModel
-} from '@tensorflow/tfjs-layers';
+  Conv2D,
+  UpSampling2D
+} from '@tensorflow/tfjs-layers/dist/layers/convolutional';
+import { MaxPooling2D } from '@tensorflow/tfjs-layers/dist/layers/pooling';
+import { Concatenate } from '@tensorflow/tfjs-layers/dist/layers/merge';
+import { LayersModel } from '@tensorflow/tfjs-layers/dist/engine/training';
+import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_layer';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
 import { avgLogLum, hdrTransferFunc, hdrTransferFuncInverse } from './process';
@@ -115,7 +121,7 @@ class UNet {
     const unetWeightTensor = this._tensors.get(name + '.weight')!;
     const unetBiasTensor = this._tensors.get(name + '.bias')!;
     const weightDims = unetWeightTensor.desc.dims;
-    const weightTensor = tfjs.tensor(
+    const weightTensor = tensor(
       changeWeightShapes(
         getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
         weightDims
@@ -123,12 +129,12 @@ class UNet {
       [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
       'float32'
     );
-    const biasTensor = tfjs.tensor1d(
+    const biasTensor = tensor1d(
       getTensorData(unetBiasTensor.data, unetBiasTensor.desc.dataType),
       'float32'
     );
     // TODO whats the purpose of padded dims ?
-    const convLayer = layers.conv2d({
+    const convLayer = new Conv2D({
       name,
       filters: unetWeightTensor.desc.dims[0],
       kernelSize: unetWeightTensor.desc.dims.slice(2, 4) as [number, number],
@@ -151,7 +157,7 @@ class UNet {
     return this._createConv(
       name,
       // Concat on the channel
-      layers.concatenate({ trainable: false, axis: 3 }).apply([
+      new Concatenate({ trainable: false, axis: 3 }).apply([
         // convLayer.apply(source2) as SymbolicTensor,
         source1,
         source2
@@ -162,25 +168,21 @@ class UNet {
 
   private _createPooling(source: SymbolicTensor) {
     // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
-    return layers
-      .maxPooling2d({
-        name: source.name + '/pooling',
-        poolSize: [2, 2],
-        strides: [2, 2],
-        padding: 'same',
-        trainable: false
-      })
-      .apply(source) as SymbolicTensor;
+    return new MaxPooling2D({
+      name: source.name + '/pooling',
+      poolSize: [2, 2],
+      strides: [2, 2],
+      padding: 'same',
+      trainable: false
+    }).apply(source) as SymbolicTensor;
   }
 
   private _addUpsamplingLayer(source: SymbolicTensor) {
-    return layers
-      .upSampling2d({
-        name: source.name + '/upsampling',
-        size: [2, 2],
-        trainable: false
-      })
-      .apply(source) as SymbolicTensor;
+    return new UpSampling2D({
+      name: source.name + '/upsampling',
+      size: [2, 2],
+      trainable: false
+    }).apply(source) as SymbolicTensor;
   }
 
   buildModel() {
@@ -190,7 +192,7 @@ class UNet {
 
     // TODO input process transferFunc
     // TODO input shape
-    const input = tfInput({
+    const input = TFInput({
       shape: [tileSize.height, tileSize.width, channels],
       dtype: 'float32'
     });
@@ -228,7 +230,7 @@ class UNet {
     const decConv1b = this._createConv('dec_conv1b', decConv1a, 'relu');
     const decConv0 = this._createConv('dec_conv0', decConv1b, 'relu');
 
-    this._tfModel = tfModel({
+    this._tfModel = new LayersModel({
       inputs: [input],
       // TODO output process transferFunc
       outputs: decConv0
@@ -426,16 +428,16 @@ class UNet {
       });
     }
 
-    let tileTensor = tfjs.tensor(
+    let tileTensor = tensor(
       tileData,
       [1, tileRawHeight, tileRawWidth, channels],
       'float32'
-    ) as tfjs.Tensor4D;
+    ) as Tensor4D;
 
     // We need resize if input size is smaller than tile size. And is rounded up.
     if (needsResize) {
       const rawTileTensor = tileTensor;
-      tileTensor = tfjs.mirrorPad(
+      tileTensor = mirrorPad(
         rawTileTensor,
         [
           [0, 0],
@@ -448,7 +450,7 @@ class UNet {
       rawTileTensor.dispose();
     }
 
-    const outputTensor = this._tfModel!.predict(tileTensor) as tfjs.Tensor;
+    const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
 
     let denoisedData = outputTensor.dataSync();
     outputTensor.dispose();

@@ -1,5 +1,5 @@
-import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
-import * as tfjs from '@tensorflow/tfjs-core';
+import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu/dist/base';
+import { ENGINE } from '@tensorflow/tfjs-core/dist/engine';
 
 import './kernels';
 
@@ -46,8 +46,8 @@ export async function initWebGPUBackendWithDevice(
   adapter: GPUAdapterInfo
 ) {
   const backend = new WebGPUBackend(device, adapter);
-  tfjs.registerBackend('webgpu-oidn', () => backend);
-  await tfjs.setBackend('webgpu-oidn');
+  ENGINE.registerBackend('webgpu-oidn', () => backend);
+  await ENGINE.setBackend('webgpu-oidn');
 
   return backend;
 }

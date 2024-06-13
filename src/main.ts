@@ -1,4 +1,4 @@
-import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
+import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu/dist/base';
 import { parseTZA } from './tza';
 import UNet from './UNet';
 import { initWebGPUBackend } from './backend';

@@ -1,4 +1,8 @@
-import { KernelConfig, registerKernel } from '@tensorflow/tfjs';
+import {
+  KernelConfig,
+  registerKernel
+} from '@tensorflow/tfjs-core/dist/kernel_registry';
+
 import { mirrorPadConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/MirrorPad';
 import { sliceConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/Slice';
 import { fusedConv2DConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/FusedConv2D';
