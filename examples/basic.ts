@@ -31,8 +31,9 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
   console.time('denoising');
   abortDenoising = unet.progressiveExecute({
     color: rawData,
-    done() {
+    done(denoised) {
       console.timeEnd('denoising');
+      // denoisedCtx.putImageData(denoised, 0, 0);
     },
     progress(tileData, _, tile) {
       denoisedCtx.putImageData(tileData, tile.x, tile.y);

@@ -82,8 +82,6 @@ class UNet {
 
   private _tileOverlapX = 0;
   private _tileOverlapY = 0;
-  // TODO
-  // private _tileOverlap = 16;
 
   private _aux = false;
   private _hdr = false;
@@ -175,7 +173,7 @@ class UNet {
       .apply(source) as tfjs.SymbolicTensor;
   }
 
-  buildModel(padDims?: number[]) {
+  buildModel() {
     const aux = this._aux;
     const channels = 3 + (aux ? 6 : 0);
     const tileSize = this._getTileSizeWithOverlap();
@@ -186,27 +184,8 @@ class UNet {
       shape: [tileSize.height, tileSize.width, channels],
       dtype: 'float32'
     });
-    let firstLayer;
-    firstLayer = input;
 
-    if (padDims) {
-      firstLayer = tfjs.layers
-        .zeroPadding2d({
-          padding: [
-            // Pad bottom
-            [0, padDims[0]],
-            // Pad right
-            [0, padDims[1]]
-          ]
-        })
-        .apply(input);
-    }
-
-    const encConv0 = this._createConv(
-      'enc_conv0',
-      firstLayer as tfjs.SymbolicTensor,
-      'relu'
-    );
+    const encConv0 = this._createConv('enc_conv0', input, 'relu');
     const pool1 = this._createPooling(
       this._createConv('enc_conv1', encConv0, 'relu')
     );
@@ -255,21 +234,14 @@ class UNet {
     let tileHeight = maxTileSize;
     let tileOverlapX = defaultTileOverlap;
     let tileOverlapY = defaultTileOverlap;
-    // let tilePaddingX = 0;
-    // let tilePaddingY = 0;
 
     if (width < maxTileSize + defaultTileOverlap * 2) {
-      // TODO tileAlignment?
-      tileWidth = width;
+      tileWidth = roundUp(width, tileAlignment);
       tileOverlapX = 0;
-      // tileWidth = roundUp(width, tileAlignment);
-      // tilePaddingX = tileWidth - width;
-      // tileWidth = width;
     }
     if (height < maxTileSize + defaultTileOverlap * 2) {
-      tileHeight = height;
+      tileHeight = roundUp(height, tileAlignment);
       tileOverlapY = 0;
-      // tileHeight = roundUp(height, tileAlignment);
     }
 
     if (
@@ -408,6 +380,7 @@ class UNet {
     width: number,
     height: number
   ) {
+    const isHDR = isHDRImageData(outputImageData);
     const channels = this._aux ? 9 : 3;
     const tileOverlapX = this._tileOverlapX;
     const tileOverlapY = this._tileOverlapY;
@@ -422,47 +395,78 @@ class UNet {
     let srcY1 = Math.min(srcY0 + srcTileSize.height, height);
     srcY0 = Math.max(srcY1 - srcTileSize.height, 0);
 
-    const tileData = this._readTile(
+    const tileRawWidth = Math.min(srcTileSize.width, width);
+    const tileRawHeight = Math.min(srcTileSize.height, height);
+    let tileData = this._readTile(
       inputData,
       channels,
-      new Tile(srcX0, srcY0, srcTileSize.width, srcTileSize.height),
+      new Tile(srcX0, srcY0, tileRawWidth, tileRawHeight),
       width
     );
-    const input = tfjs.tensor(
+    const needsResize =
+      width < dstTileSize.width || height < dstTileSize.height;
+
+    let tileTensor = tfjs.tensor(
       tileData,
-      [1, srcTileSize.height, srcTileSize.width, channels],
+      [1, tileRawHeight, tileRawWidth, channels],
       'float32'
-    );
-    const output = this._tfModel!.predict(input) as tfjs.Tensor;
-    const denoisedData = output.dataSync();
-    output.dispose();
-    input.dispose();
+    ) as tfjs.Tensor4D;
 
-    const dstX0 = i * dstTileSize.width;
-    const dstY0 = j * dstTileSize.height;
+    // We need resize if input size is smaller than tile size. And is rounded up.
+    if (needsResize) {
+      const rawTileTensor = tileTensor;
+      tileTensor = tfjs.image.resizeBilinear(tileTensor, [
+        srcTileSize.height,
+        srcTileSize.width
+      ]);
+      rawTileTensor.dispose();
+    }
 
-    const srcTile = new Tile(
-      srcX0,
-      srcY0,
-      srcTileSize.width,
-      srcTileSize.height
-    );
+    let outputTensor = this._tfModel!.predict(tileTensor) as tfjs.Tensor;
+
+    // We need resize if input size is smaller than tile size. And is rounded up.
+    if (needsResize) {
+      const rawOutputTensor = outputTensor;
+      outputTensor = tfjs.image.resizeBilinear(outputTensor as tfjs.Tensor3D, [
+        height,
+        width
+      ]);
+      rawOutputTensor.dispose();
+    }
+
+    const denoisedData = outputTensor.dataSync();
+    outputTensor.dispose();
+    tileTensor.dispose();
+
+    const dstWidth = Math.min(dstTileSize.width, width);
+    const dstHeight = Math.min(dstTileSize.height, height);
+    const dstX0 = i * dstWidth;
+    const dstY0 = j * dstHeight;
     this._writeTile(
       outputImageData,
-      srcTile,
-      new Tile(dstX0, dstY0, dstTileSize.width, dstTileSize.height),
+      new Tile(srcX0, srcY0, tileRawWidth, tileRawHeight),
+      new Tile(
+        dstX0,
+        dstY0,
+        Math.min(dstWidth, width),
+        Math.min(dstHeight, height)
+      ),
       denoisedData as Float32Array
     );
 
-    // Write tile for progressive rendering.
-    // TODO should write to tile first
-    for (let y = 0; y < dstTileSize.height; y++) {
-      for (let x = 0; x < dstTileSize.width; x++) {
-        const i1 = (y * dstTileSize.width + x) * 4;
-        const i2 = ((y + dstY0) * width + (x + dstX0)) * 4;
+    if (needsResize) {
+      outputTileData.data.set(outputImageData.data);
+    } else {
+      // Write tile for progressive rendering.
+      // TODO should write to tile first
 
-        for (let c = 0; c < 4; c++) {
-          outputTileData.data[i1 + c] = outputImageData.data[i2 + c];
+      for (let y = 0; y < dstHeight; y++) {
+        for (let x = 0; x < dstWidth; x++) {
+          const i1 = (y * dstWidth + x) * 4;
+          const i2 = ((y + dstY0) * width + (x + dstX0)) * 4;
+          for (let c = 0; c < 4; c++) {
+            outputTileData.data[i1 + c] = outputImageData.data[i2 + c];
+          }
         }
       }
     }
@@ -525,7 +529,10 @@ class UNet {
     // TODO small width and height
 
     const outputImageData = makeImageData(width, height);
-    const outputTileData = makeImageData(tileWidth, tileHeight);
+    const outputTileData = makeImageData(
+      Math.min(tileWidth, width),
+      Math.min(tileHeight, height)
+    );
 
     let aborted = false;
 
