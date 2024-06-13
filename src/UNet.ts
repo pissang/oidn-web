@@ -251,10 +251,6 @@ class UNet {
   }
 
   private _updateModel(width: number, height: number) {
-    if (this._tfModel) {
-      this._tfModel.dispose();
-    }
-
     let tileWidth = maxTileSize;
     let tileHeight = maxTileSize;
     let tileOverlapX = defaultTileOverlap;
@@ -280,12 +276,18 @@ class UNet {
       tileWidth !== this._tileWidth ||
       tileHeight !== this._tileHeight ||
       tileOverlapX !== this._tileOverlapX ||
-      tileOverlapY !== this._tileOverlapY
+      tileOverlapY !== this._tileOverlapY ||
+      !this._tfModel
     ) {
       this._tileWidth = tileWidth;
       this._tileHeight = tileHeight;
       this._tileOverlapX = tileOverlapX;
       this._tileOverlapY = tileOverlapY;
+
+      if (this._tfModel) {
+        this._tfModel.dispose();
+      }
+
       this.buildModel();
     }
   }
