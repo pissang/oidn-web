@@ -8,7 +8,13 @@ const denoisedCtx = (
   document.getElementById('denoised') as HTMLCanvasElement
 ).getContext('2d')!;
 
+let abortDenoising;
+
 function denoise(rawImage: HTMLImageElement, unet: UNet) {
+  if (abortDenoising) {
+    abortDenoising();
+  }
+
   const width = +(document.getElementById('width') as HTMLInputElement).value;
   const height = +(document.getElementById('height') as HTMLInputElement).value;
 
@@ -23,13 +29,15 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
 
   const rawData = rawCtx.getImageData(0, 0, width, height);
   console.time('denoising');
-  unet
-    .executeImageData(rawData, undefined, undefined, (tileData, _, tile) => {
-      denoisedCtx.putImageData(tileData, tile.x, tile.y);
-    })
-    .then((denoisedData) => {
+  abortDenoising = unet.progressiveExecute({
+    color: rawData,
+    done() {
       console.timeEnd('denoising');
-    });
+    },
+    progress(tileData, _, tile) {
+      denoisedCtx.putImageData(tileData, tile.x, tile.y);
+    }
+  });
 }
 
 initUNetFromModelPath('../weights/rt_ldr.tza', {

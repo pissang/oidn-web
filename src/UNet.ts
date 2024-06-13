@@ -468,18 +468,25 @@ class UNet {
     }
   }
 
-  async executeImageData<T extends ImageData | HDRImageData>(
-    color: T,
-    albedo?: ImageData,
-    normal?: ImageData,
-    onProgress?: (
+  progressiveExecute<T extends ImageData | HDRImageData>({
+    color,
+    albedo,
+    normal,
+    done,
+    progress
+  }: {
+    color: T;
+    albedo?: ImageData;
+    normal?: ImageData;
+    done: (outputData: T) => void;
+    progress?: (
       tileData: T,
       outputData: T,
       tile: Tile,
       currentIdx: number,
       totalIdx: number
-    ) => void
-  ): Promise<T> {
+    ) => void;
+  }): () => void {
     if (this._aux && (!albedo || !normal)) {
       throw new Error('Normal map and albedo map are both required');
     }
@@ -517,43 +524,50 @@ class UNet {
     // TODO tile pad?
     // TODO small width and height
 
-    return new Promise((resolve) => {
-      const outputImageData = makeImageData(width, height);
-      const outputTileData = makeImageData(tileWidth, tileHeight);
+    const outputImageData = makeImageData(width, height);
+    const outputTileData = makeImageData(tileWidth, tileHeight);
 
-      const executeTile = (i: number, j: number) => {
-        this._executeTile(
-          rawData,
-          outputTileData,
-          outputImageData,
-          i,
-          j,
-          width,
-          height
-        );
-        onProgress?.(
-          outputTileData as T,
-          outputImageData as T,
-          new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
-          i + j * tileCountW,
-          tileCountW * tileCountH
-        );
+    let aborted = false;
 
-        if (i + 1 < tileCountW || j + 1 < tileCountH) {
-          requestAnimationFrame(() => {
-            if (i + 1 < tileCountW) {
-              executeTile(i + 1, j);
-            } else if (j + 1 < tileCountH) {
-              executeTile(0, j + 1);
-            }
-          });
-        } else {
-          resolve(outputImageData as T);
-        }
-      };
+    const executeTile = (i: number, j: number) => {
+      if (aborted) {
+        return;
+      }
+      this._executeTile(
+        rawData,
+        outputTileData,
+        outputImageData,
+        i,
+        j,
+        width,
+        height
+      );
+      progress?.(
+        outputTileData as T,
+        outputImageData as T,
+        new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
+        i + j * tileCountW,
+        tileCountW * tileCountH
+      );
 
-      executeTile(0, 0);
-    });
+      if (i + 1 < tileCountW || j + 1 < tileCountH) {
+        requestAnimationFrame(() => {
+          if (i + 1 < tileCountW) {
+            executeTile(i + 1, j);
+          } else if (j + 1 < tileCountH) {
+            executeTile(0, j + 1);
+          }
+        });
+      } else {
+        done(outputImageData as T);
+      }
+    };
+
+    executeTile(0, 0);
+
+    return () => {
+      aborted = true;
+    };
   }
 
   dispose() {

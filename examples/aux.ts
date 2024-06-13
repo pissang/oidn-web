@@ -10,6 +10,8 @@ const denoisedCtx = (
   document.getElementById('denoised') as HTMLCanvasElement
 ).getContext('2d')!;
 
+let abortDenoising;
+
 function loadImage(url: string) {
   return new Promise<HTMLImageElement>((resolve) => {
     const image = new Image();
@@ -46,18 +48,16 @@ initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', {
     rawCtx.drawImage(colorImage, 0, 0, w, h);
     const colorData = rawCtx.getImageData(0, 0, w, h);
     console.time('denoising');
-    unet
-      .executeImageData(
-        colorData,
-        albedoData,
-        normData,
-        (tileData, _, tile) => {
-          denoisedCtx.putImageData(tileData, tile.x, tile.y);
-        }
-      )
-      .then((denoisedData) => {
-        // denoisedCtx.putImageData(denoisedData, 0, 0);
+    abortDenoising = unet.progressiveExecute({
+      color: colorData,
+      albedo: albedoData,
+      normal: normData,
+      done() {
         console.timeEnd('denoising');
-      });
+      },
+      progress(tileData, _, tile) {
+        denoisedCtx.putImageData(tileData, tile.x, tile.y);
+      }
+    });
   });
 });
