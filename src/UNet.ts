@@ -80,7 +80,8 @@ class UNet {
   private _tileWidth = 0;
   private _tileHeight = 0;
 
-  private _tileOverlap = 0;
+  private _tileOverlapX = 0;
+  private _tileOverlapY = 0;
   // TODO
   // private _tileOverlap = 16;
 
@@ -182,7 +183,7 @@ class UNet {
     // TODO input process transferFunc
     // TODO input shape
     const input = tfjs.input({
-      shape: [tileSize.width, tileSize.height, channels],
+      shape: [tileSize.height, tileSize.width, channels],
       dtype: 'float32'
     });
     let firstLayer;
@@ -256,37 +257,43 @@ class UNet {
 
     let tileWidth = maxTileSize;
     let tileHeight = maxTileSize;
-    let tileOverlap = defaultTileOverlap;
+    let tileOverlapX = defaultTileOverlap;
+    let tileOverlapY = defaultTileOverlap;
     // let tilePaddingX = 0;
     // let tilePaddingY = 0;
 
     if (width < maxTileSize + defaultTileOverlap * 2) {
       // TODO tileAlignment?
       tileWidth = width;
-      tileOverlap = 0;
+      tileOverlapX = 0;
       // tileWidth = roundUp(width, tileAlignment);
       // tilePaddingX = tileWidth - width;
       // tileWidth = width;
     }
     if (height < maxTileSize + defaultTileOverlap * 2) {
       tileHeight = height;
-      tileOverlap = 0;
+      tileOverlapY = 0;
       // tileHeight = roundUp(height, tileAlignment);
     }
 
-    if (tileWidth !== this._tileWidth || tileHeight !== this._tileHeight) {
+    if (
+      tileWidth !== this._tileWidth ||
+      tileHeight !== this._tileHeight ||
+      tileOverlapX !== this._tileOverlapX ||
+      tileOverlapY !== this._tileOverlapY
+    ) {
       this._tileWidth = tileWidth;
       this._tileHeight = tileHeight;
-      this._tileOverlap = tileOverlap;
+      this._tileOverlapX = tileOverlapX;
+      this._tileOverlapY = tileOverlapY;
+      this.buildModel();
     }
-
-    this.buildModel();
   }
 
   private _getTileSizeWithOverlap() {
     return {
-      width: this._tileWidth + 2 * this._tileOverlap,
-      height: this._tileHeight + 2 * this._tileOverlap
+      width: this._tileWidth + 2 * this._tileOverlapX,
+      height: this._tileHeight + 2 * this._tileOverlapY
     };
   }
 
@@ -399,15 +406,16 @@ class UNet {
     height: number
   ) {
     const channels = this._aux ? 9 : 3;
-    const tileOverlap = this._tileOverlap;
+    const tileOverlapX = this._tileOverlapX;
+    const tileOverlapY = this._tileOverlapY;
     let srcTileSize = this._getTileSizeWithOverlap();
     let dstTileSize = { width: this._tileWidth, height: this._tileHeight };
 
-    let srcX0 = i > 0 ? i * dstTileSize.width - tileOverlap : 0;
+    let srcX0 = i > 0 ? i * dstTileSize.width - tileOverlapX : 0;
     let srcX1 = Math.min(srcX0 + srcTileSize.width, width);
     srcX0 = Math.max(srcX1 - srcTileSize.width, 0);
 
-    let srcY0 = j > 0 ? j * dstTileSize.height - tileOverlap : 0;
+    let srcY0 = j > 0 ? j * dstTileSize.height - tileOverlapY : 0;
     let srcY1 = Math.min(srcY0 + srcTileSize.height, height);
     srcY0 = Math.max(srcY1 - srcTileSize.height, 0);
 
@@ -419,7 +427,7 @@ class UNet {
     );
     const input = tfjs.tensor(
       tileData,
-      [1, srcTileSize.width, srcTileSize.height, channels],
+      [1, srcTileSize.height, srcTileSize.width, channels],
       'float32'
     );
     const output = this._tfModel!.predict(input) as tfjs.Tensor;
@@ -463,17 +471,17 @@ class UNet {
       }
     }
 
-    this._updateModel(color.width, color.height);
+    const width = color.width;
+    const height = color.height;
+    this._updateModel(width, height);
 
     // TODO should fixed to be hdr when UNet is created.
     // weights of hdr and ldr is different
     const isHDR = isHDRImageData(color);
 
     const rawData = this._processImageData(color, albedo, normal);
-    const width = color.width;
-    const height = color.height;
     const tileCountH = Math.ceil(height / this._tileHeight);
-    const tileCountW = Math.ceil(width / this._tileHeight);
+    const tileCountW = Math.ceil(width / this._tileWidth);
 
     const outputImageData = isHDR
       ? {

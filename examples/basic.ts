@@ -17,7 +17,9 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
   denoisedCtx.canvas.width = width;
   denoisedCtx.canvas.height = height;
 
-  rawCtx.drawImage(rawImage, 0, 0, width, height);
+  const pattern = rawCtx.createPattern(rawImage, 'repeat');
+  rawCtx.fillStyle = pattern;
+  rawCtx.fillRect(0, 0, width, height);
 
   const rawData = rawCtx.getImageData(0, 0, width, height);
   console.time('denoising');

@@ -15,21 +15,21 @@
       #resize-input {
         display: flex;
         flex-direction: row;
-        margin-top: 10px;
+        margin-bottom: 10px;
       }
       #resize-input * {
         margin-left: 10px;
       }
     </style>
     <body>
+      <div id="resize-inputs">
+        <input value="1024" type="number" id="width" />
+        <input value="512" type="number" id="height" />
+        <button id="resize">Resize</button>
+      </div>
       <div id="compare">
         <canvas id="raw" style="width: 50%"></canvas>
         <canvas id="denoised" style="width: 50%"></canvas>
-      </div>
-      <div id="resize-inputs">
-        <input value="512" type="number" id="width" />
-        <input value="512" type="number" id="height" />
-        <button id="resize">Resize</button>
       </div>
     </body>
     <script src="./basic.ts" type="module"></script>
