@@ -72,9 +72,9 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
   Promise.all([
-    loadHDR('./test/test5_color.hdr'),
-    loadImage('./test/test5_albedo.png'),
-    loadImage('./test/test5_norm.png')
+    loadHDR('./test/test4_color.hdr'),
+    loadImage('./test/test4_albedo.png'),
+    loadImage('./test/test4_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
     const w = colorData.width;
     const h = colorData.height;
@@ -97,6 +97,7 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       color: colorData,
       albedo: albedoData,
       normal: normData,
+      hdr: true,
       done() {
         console.timeEnd('denoising');
       },

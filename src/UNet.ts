@@ -15,7 +15,7 @@ import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_laye
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
 import { avgLogLum, hdrTransferFunc, hdrTransferFuncInverse } from './process';
-import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
+import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
 import { profileAndLogKernelCode } from './helper';
 
 function getTensorData(
@@ -58,6 +58,12 @@ interface HDRImageData {
   height: number;
 }
 
+interface GPUImageData {
+  data: GPUBuffer;
+  width: number;
+  height: number;
+}
+
 class Tile {
   constructor(
     public x: number,
@@ -75,8 +81,10 @@ function roundUp2(a: number, b: number, c: number) {
   return Math.ceil((a - c) / b) * b + c;
 }
 
-function isHDRImageData(data: ImageData | HDRImageData): data is HDRImageData {
-  return data.data instanceof Float32Array;
+function isGPUImageData(
+  data: ImageData | GPUImageData | HDRImageData
+): data is GPUImageData {
+  return data.data instanceof GPUBuffer;
 }
 
 const receptiveField = 174; // receptive field in pixels
@@ -281,8 +289,9 @@ class UNet {
 
   private _processImageData(
     color: ImageData | HDRImageData,
-    albedo?: ImageData,
-    normal?: ImageData
+    albedo: ImageData | undefined,
+    normal: ImageData | undefined,
+    isHDR: boolean
   ) {
     const rawData = color.data;
     const pixelsCount = rawData.length / 4;
@@ -305,7 +314,6 @@ class UNet {
 
     const albedoData = albedo?.data;
     const normalData = normal?.data;
-    const isHDR = isHDRImageData(color);
     for (let i = 0; i < rawData.length; i += 4) {
       const i2 = (i / 4) * channels;
 
@@ -354,12 +362,12 @@ class UNet {
     srcTile: Tile,
     dstTile: Tile,
     srcTileData: Float32Array,
-    srcWidth: number
+    srcWidth: number,
+    isHDR: boolean
   ) {
     const { data: outImageData, width } = imageData;
     const dx = dstTile.x - srcTile.x;
     const dy = dstTile.y - srcTile.y;
-    const isHDR = isHDRImageData(imageData);
     for (let y = 0; y < dstTile.height; y++) {
       for (let x = 0; x < dstTile.width; x++) {
         const i1 = ((y + dy) * srcWidth + x + dx) * 3;
@@ -387,9 +395,9 @@ class UNet {
     i: number,
     j: number,
     width: number,
-    height: number
+    height: number,
+    isHDR: boolean
   ) {
-    const isHDR = isHDRImageData(outputImageData);
     const channels = this._aux ? 9 : 3;
     const tileOverlapX = this._tileOverlapX;
     const tileOverlapY = this._tileOverlapY;
@@ -478,7 +486,8 @@ class UNet {
         Math.min(dstHeight, height)
       ),
       denoisedData as Float32Array,
-      srcTileSize.width
+      srcTileSize.width,
+      isHDR
     );
 
     if (needsResize) {
@@ -499,16 +508,20 @@ class UNet {
     }
   }
 
-  progressiveExecute<T extends ImageData | HDRImageData>({
+  private _executeTileGPU() {}
+
+  progressiveExecute<T extends ImageData | HDRImageData | GPUImageData>({
     color,
     albedo,
     normal,
+    hdr,
     done,
     progress
   }: {
     color: T;
     albedo?: ImageData;
     normal?: ImageData;
+    hdr?: boolean;
     done: (outputData: T) => void;
     progress?: (
       tileData: T,
@@ -534,16 +547,19 @@ class UNet {
 
     // TODO should fixed to be hdr when UNet is created.
     // weights of hdr and ldr is different
-    const isHDR = isHDRImageData(color);
 
-    const rawData = this._processImageData(color, albedo, normal);
+    hdr = hdr || false;
+    let rawData: Float32Array;
+    if (!isGPUImageData(color)) {
+      rawData = this._processImageData(color, albedo, normal, hdr);
+    }
     const tileWidth = this._tileWidth;
     const tileHeight = this._tileHeight;
     const tileCountH = Math.ceil(height / tileHeight);
     const tileCountW = Math.ceil(width / tileWidth);
 
     function makeImageData(width: number, height: number) {
-      return isHDR
+      return hdr
         ? {
             data: new Float32Array(width * height * 4),
             width,
@@ -575,7 +591,8 @@ class UNet {
           i,
           j,
           width,
-          height
+          height,
+          hdr
         );
       }, true);
       progress?.(
