@@ -42,6 +42,9 @@ export class WGPUComputePass<I extends string, O extends string> {
   private _width = 10;
   private _height = 10;
 
+  private _execWidth?: number;
+  private _execHeight?: number;
+
   private _csCode = '';
   private _csMain;
   private _csDefine;
@@ -89,6 +92,13 @@ export class WGPUComputePass<I extends string, O extends string> {
       this._resizeOutputBuffers();
       this._needsUpdatePipeline = true;
     }
+  }
+
+  setExecuteSize(width: number, height: number) {
+    width = Math.ceil(width);
+    height = Math.ceil(height);
+    this._execWidth = width;
+    this._execHeight = height;
   }
 
   setOutputParams(outputParams: Record<O, WGPUComputePassOutput>) {
@@ -277,8 +287,8 @@ ${this._csMain}
       computePass.setBindGroup(idx, bindGroup);
     });
     computePass.dispatchWorkgroups(
-      Math.ceil(this._width / WORKGROUP_SIZE),
-      Math.ceil(this._height / WORKGROUP_SIZE),
+      Math.ceil((this._execWidth ?? this._width) / WORKGROUP_SIZE),
+      Math.ceil((this._execHeight ?? this._height) / WORKGROUP_SIZE),
       1
     );
     // End the render pass
