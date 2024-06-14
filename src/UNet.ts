@@ -97,6 +97,7 @@ const maxTileSize = 512;
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
 class UNet {
   private _tfModel: LayersModel | undefined;
+  private _device: GPUDevice | undefined;
 
   // TODO calculate the tile size from memory size
   // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
@@ -119,6 +120,8 @@ class UNet {
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
+
+    this._device = this._backend?.device;
   }
 
   private _createConv(
@@ -389,7 +392,13 @@ class UNet {
   }
 
   private _executeTile(
-    inputData: Float32Array,
+    inputData:
+      | Float32Array
+      | {
+          color: GPUBuffer;
+          albedo?: GPUBuffer;
+          normal?: GPUBuffer;
+        },
     outputTileData: ImageData | HDRImageData,
     outputImageData: ImageData | HDRImageData,
     i: number,
@@ -414,33 +423,34 @@ class UNet {
 
     const tileRawWidth = Math.min(srcTileSize.width, width);
     const tileRawHeight = Math.min(srcTileSize.height, height);
-    let tileData = this._readTile(
-      inputData,
-      channels,
-      new Tile(srcX0, srcY0, tileRawWidth, tileRawHeight),
-      width
-    );
     const needsResize =
       width < dstTileSize.width || height < dstTileSize.height;
+    const srcTile = new Tile(srcX0, srcY0, tileRawWidth, tileRawHeight);
 
+    let tileTensor: Tensor;
     let inputScale = 1;
-    if (isHDR) {
-      inputScale = avgLogLum({
-        data: tileData,
-        channels: 9
-      });
-      tileData = hdrTransferFunc({
-        data: tileData,
-        channels: 9,
-        inputScale
-      });
-    }
+    if (inputData instanceof Float32Array) {
+      let tileData = this._readTile(inputData, channels, srcTile, width);
 
-    let tileTensor = tensor(
-      tileData,
-      [1, tileRawHeight, tileRawWidth, channels],
-      'float32'
-    ) as Tensor4D;
+      if (isHDR) {
+        inputScale = avgLogLum({
+          data: tileData,
+          channels: 9
+        });
+        tileData = hdrTransferFunc({
+          data: tileData,
+          channels: 9,
+          inputScale
+        });
+      }
+      tileTensor = tensor(
+        tileData,
+        [1, tileRawHeight, tileRawWidth, channels],
+        'float32'
+      ) as Tensor4D;
+    } else {
+      const device = this._device;
+    }
 
     // We need resize if input size is smaller than tile size. And is rounded up.
     if (needsResize) {
@@ -476,6 +486,7 @@ class UNet {
     const dstHeight = Math.min(dstTileSize.height, height);
     const dstX0 = i * dstWidth;
     const dstY0 = j * dstHeight;
+
     this._writeTile(
       outputImageData,
       new Tile(srcX0, srcY0, tileRawWidth, tileRawHeight),
@@ -490,25 +501,16 @@ class UNet {
       isHDR
     );
 
-    if (needsResize) {
-      outputTileData.data.set(outputImageData.data);
-    } else {
-      // Write tile for progressive rendering.
-      // TODO should write to tile first
-
-      for (let y = 0; y < dstHeight; y++) {
-        for (let x = 0; x < dstWidth; x++) {
-          const i1 = (y * dstWidth + x) * 4;
-          const i2 = ((y + dstY0) * width + (x + dstX0)) * 4;
-          for (let c = 0; c < 4; c++) {
-            outputTileData.data[i1 + c] = outputImageData.data[i2 + c];
-          }
+    for (let y = 0; y < dstHeight; y++) {
+      for (let x = 0; x < dstWidth; x++) {
+        const i1 = (y * dstWidth + x) * 4;
+        const i2 = ((y + dstY0) * width + (x + dstX0)) * 4;
+        for (let c = 0; c < 4; c++) {
+          outputTileData.data[i1 + c] = outputImageData.data[i2 + c];
         }
       }
     }
   }
-
-  private _executeTileGPU() {}
 
   progressiveExecute<T extends ImageData | HDRImageData | GPUImageData>({
     color,
@@ -524,7 +526,7 @@ class UNet {
     hdr?: boolean;
     done: (outputData: T) => void;
     progress?: (
-      tileData: T,
+      tileData: T | undefined,
       outputData: T,
       tile: Tile,
       currentIdx: number,
@@ -568,9 +570,6 @@ class UNet {
         : new ImageData(width, height);
     }
 
-    // TODO tile pad?
-    // TODO small width and height
-
     const outputImageData = makeImageData(width, height);
     const outputTileData = makeImageData(
       Math.min(tileWidth, width),
@@ -596,7 +595,8 @@ class UNet {
         );
       }, true);
       progress?.(
-        outputTileData as T,
+        // Is undefined if using webgpu buffer
+        outputTileData as T | undefined,
         outputImageData as T,
         new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
         i + j * tileCountW,
