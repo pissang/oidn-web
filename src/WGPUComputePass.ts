@@ -131,7 +131,10 @@ export class WGPUComputePass<I extends string, O extends string> {
       label: this._label,
       // webgpu needs buffer at least 80 bytes.
       size: Math.max(byteLength, 80),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      usage:
+        GPUBufferUsage.STORAGE |
+        GPUBufferUsage.COPY_DST |
+        GPUBufferUsage.COPY_SRC
     });
   }
 

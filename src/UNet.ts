@@ -112,7 +112,7 @@ class UNet {
 
   constructor(
     private _tensors: Map<string, HostTensor>,
-    private _backend?: WebGPUBackend,
+    private _backend: WebGPUBackend,
     opts: {
       aux?: boolean;
       hdr?: boolean;
@@ -121,7 +121,7 @@ class UNet {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
 
-    this._device = this._backend?.device;
+    this._device = this._backend.device;
   }
 
   private _createConv(
@@ -194,6 +194,10 @@ class UNet {
       size: [2, 2],
       trainable: false
     }).apply(source) as SymbolicTensor;
+  }
+
+  getDevice() {
+    return this._device;
   }
 
   buildModel() {
@@ -400,8 +404,8 @@ class UNet {
           albedo: GPUBuffer;
           normal: GPUBuffer;
         },
-    outputTileData?: ImageData | HDRImageData,
-    outputImageData?: ImageData | HDRImageData,
+    outputTileData: ImageData | HDRImageData | undefined,
+    outputImageData: ImageData | HDRImageData | undefined,
     i: number,
     j: number,
     width: number,
@@ -445,12 +449,12 @@ class UNet {
           channels: 9,
           inputScale
         });
-        tileTensor = tensor(
-          tileData,
-          [1, srcTileHeight, srcTileWidth, channels],
-          'float32'
-        ) as Tensor4D;
       }
+      tileTensor = tensor(
+        tileData,
+        [1, srcTileHeight, srcTileWidth, channels],
+        'float32'
+      ) as Tensor4D;
     } else {
       if (!isHDR) {
         throw new Error('Only hdr is supported for webgpu data.');
@@ -554,8 +558,8 @@ class UNet {
     progress
   }: {
     color: T;
-    albedo?: ImageData;
-    normal?: ImageData;
+    albedo?: ImageData | GPUImageData;
+    normal?: ImageData | GPUImageData;
     hdr?: boolean;
     done: (outputData: T) => void;
     progress?: (
@@ -586,7 +590,12 @@ class UNet {
     hdr = hdr || false;
     let rawData: Float32Array;
     if (!isGPUImageData(color)) {
-      rawData = this._processImageData(color, albedo, normal, hdr);
+      rawData = this._processImageData(
+        color,
+        albedo as ImageData,
+        normal as ImageData,
+        hdr
+      );
     }
     const tileWidth = this._tileWidth;
     const tileHeight = this._tileHeight;
@@ -619,7 +628,13 @@ class UNet {
       let resGPUBuffer;
       profileAndLogKernelCode(() => {
         resGPUBuffer = this._executeTile(
-          rawData,
+          isGPUImageData(color)
+            ? {
+                color: color.data,
+                albedo: (albedo as GPUImageData).data,
+                normal: (normal as GPUImageData).data
+              }
+            : rawData,
           outputTileData,
           outputImageData,
           i,
@@ -629,10 +644,15 @@ class UNet {
           hdr
         );
       }, true);
+      const output = outputImageData || {
+        data: resGPUBuffer,
+        width,
+        height
+      };
       progress?.(
         // Is undefined if using webgpu buffer
         outputTileData as T | undefined,
-        (outputImageData || resGPUBuffer) as T,
+        output as T,
         new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
         i + j * tileCountW,
         tileCountW * tileCountH
@@ -647,7 +667,7 @@ class UNet {
           }
         });
       } else {
-        done(outputImageData as T);
+        done(output as T);
       }
     };
 

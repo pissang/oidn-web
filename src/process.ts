@@ -123,20 +123,20 @@ export function hdrTransferFuncInverseCPU({
 }
 
 const constsCode = `
-const let a = ${a};
-const let b = ${b};
-const let c = ${c};
-const let d = ${d};
-const let e = ${e};
-const let f = ${f};
-const let g = ${g};
-const let y0 =${y0};
-const let y1 =${y1};
-const let x0 =${x0};
-const let x1 =${x1};
+const a = ${a};
+const b = ${b};
+const c = ${c};
+const d = ${d};
+const e = ${e};
+const f = ${f};
+const g = ${g};
+const y0 =${y0};
+const y1 =${y1};
+const x0 =${x0};
+const x1 =${x1};
 
-const let normScale = ${normScale};
-const let rcpNormScale = ${rcpNormScale};
+const normScale = ${normScale};
+const rcpNormScale = ${rcpNormScale};
 `;
 
 export class GPUDataProcess {
@@ -184,9 +184,9 @@ fn PUForward(y: f32) -> f32 {
 let x = f32(globalId.x);
 let y = f32(globalId.y);
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
-let col = color[inIdx] * inputScale;
-let alb = albedo[inIdx];
-let nor = normal[inIdx];
+let col = in_color[inIdx] * inputScale;
+let alb = in_albedo[inIdx];
+let nor = in_normal[inIdx];
 
 let outIdx = i32(y * outputSize.x + x);
 out_color[outIdx] = vec3f(PUForward(col.r), PUForward(col.g), PUForward(col.b)) * normScale;
@@ -250,7 +250,7 @@ if (x >= outputSize.x || y >= outputSize.y) {
 }
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
 let outIdx = i32((y + outputOffset.y) * imageSize.x + (x + outputOffset.y));
-let col = color[inIdx] * rcpNormScale;
+let col = in_color[inIdx] * rcpNormScale;
 out_color[outIdx] = vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale;
 `
     });

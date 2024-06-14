@@ -17,7 +17,7 @@ export async function initUNEtFromModelBuffer(
     backend = await initWebGPUBackend();
   }
   const tensors = parseTZA(tzaBuffer);
-  const unet = new UNet(tensors, backend, opts);
+  const unet = new UNet(tensors, backend!, opts);
   return unet;
 }
 
