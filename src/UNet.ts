@@ -14,7 +14,11 @@ import { LayersModel } from '@tensorflow/tfjs-layers/dist/engine/training';
 import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_layer';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
-import { avgLogLum, hdrTransferFunc, hdrTransferFuncInverse } from './process';
+import {
+  avgLogLum,
+  hdrTransferFuncCPU,
+  hdrTransferFuncInverseCPU
+} from './process';
 import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
 import { profileAndLogKernelCode } from './helper';
 
@@ -437,7 +441,7 @@ class UNet {
           data: tileData,
           channels: 9
         });
-        tileData = hdrTransferFunc({
+        tileData = hdrTransferFuncCPU({
           data: tileData,
           channels: 9,
           inputScale
@@ -475,7 +479,7 @@ class UNet {
     tileTensor.dispose();
 
     if (isHDR) {
-      denoisedData = hdrTransferFuncInverse({
+      denoisedData = hdrTransferFuncInverseCPU({
         data: denoisedData as Float32Array,
         channels: 3,
         inputScale

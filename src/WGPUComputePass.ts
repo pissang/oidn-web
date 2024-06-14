@@ -52,15 +52,15 @@ export class WGPUComputePass<I extends string, O extends string> {
     opts: {
       inputs: I[];
       outputs: O[];
-      fsMain: string;
-      fsDefine?: string;
+      csMain: string;
+      csDefine?: string;
       uniforms: Uniform[];
     }
   ) {
     this._label = label;
     this._device = device;
-    this._csMain = opts.fsMain;
-    this._csDefine = opts.fsDefine;
+    this._csMain = opts.csMain;
+    this._csDefine = opts.csDefine;
     this._inputs = opts.inputs;
     this._outputs = opts.outputs;
     this._uniforms = opts.uniforms;
@@ -184,13 +184,13 @@ export class WGPUComputePass<I extends string, O extends string> {
   private _getFullCs() {
     const inputs = this._inputs;
     const hasInputs = inputs.length > 0;
-    const fs = `
+    const cs = `
 ${inputs
   .sort()
   .map(
     (bufferName, idx) =>
       // TODO more channels option.
-      `@group(0) @binding(${idx}) var<storage, read> ${bufferName}: array<vec4f>;`
+      `@group(0) @binding(${idx}) var<storage, read> in_${bufferName}: array<vec4f>;`
   )
   .join('\n')}
 ${this._uniforms
@@ -214,12 +214,12 @@ ${this._outputs
   .join('\n')}
 ${this._csDefine ?? ''}
 @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE}, 1)
-fn main(@builtin(global_invocation_id) globalId: vec3u){
+fn main(@builtin(global_invocation_id) globalId: vec3u) {
 ${this._csMain}
 }
 `;
 
-    return fs;
+    return cs;
   }
 
   private _updateBindGroups() {

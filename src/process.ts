@@ -1,3 +1,5 @@
+import { WGPUComputePass } from './WGPUComputePass';
+
 const a = 1.41283765e3;
 const b = 1.64593172;
 const c = 4.31384981e-1;
@@ -64,7 +66,7 @@ export function avgLogLum({
   return key / Math.pow(2, averageLuminance);
 }
 
-export function hdrTransferFunc({
+export function hdrTransferFuncCPU({
   data,
   channels,
   inputScale
@@ -88,7 +90,7 @@ export function hdrTransferFunc({
   return newData;
 }
 
-export function hdrTransferFuncInverse({
+export function hdrTransferFuncInverseCPU({
   data,
   channels,
   inputScale
@@ -109,4 +111,108 @@ export function hdrTransferFuncInverse({
   }
 
   return newData;
+}
+
+const constsCode = `
+const let a = ${a};
+const let b = ${b};
+const let c = ${c};
+const let d = ${d};
+const let e = ${e};
+const let f = ${f};
+const let g = ${g};
+const let y0 =${y0};
+const let y1 =${y1};
+const let x0 =${x0};
+const let x1 =${x1};
+
+const let normScale = ${normScale};
+const let rcpNormScale = ${rcpNormScale};
+`;
+
+let hdrTransferFuncGPUPass: WGPUComputePass<
+  'color' | 'albedo' | 'normal',
+  'color' | 'albedo' | 'normal'
+>;
+let hdrTransferFuncInverseGPUPass: WGPUComputePass<'color', 'color'>;
+export function hdrTransferFuncGPU(
+  device: GPUDevice,
+  buffer: GPUBuffer,
+  channels: number
+) {
+  if (!hdrTransferFuncGPUPass) {
+    hdrTransferFuncGPUPass = new WGPUComputePass('hdrTransferFunc', device, {
+      inputs: ['color', 'albedo', 'normal'],
+      outputs: ['color', 'albedo', 'normal'],
+      uniforms: [
+        {
+          label: 'inputScale',
+          type: 'f32',
+          data: new Float32Array([1])
+        }
+      ],
+      csDefine: /* wgsl */ `
+${constsCode}
+fn PUForward(y: f32) -> f32 {
+  if (y <= y0) {
+    return a * y;
+  } else if (y <= y1) {
+    return b * pow(y, c) + d;
+  } else {
+    return e * log(y + f) + g;
+  }
+}
+`,
+      csMain: /* wgsl */ `
+
+let col = color[global_id] * inputScale;
+let alb = albedo[global_id];
+let nor = normal[global_id];
+
+out_color = vec3f(PUForward(col.r), PUForward(col.g), PUForward(col.b)) * normScale;
+out_normal = nor.rgb;
+out_albedo = alb.rgb;
+`
+    });
+  }
+}
+
+export function hdrTransferFuncInverseGPU(
+  device: GPUDevice,
+  buffer: GPUBuffer,
+  channels: number
+) {
+  if (!hdrTransferFuncInverseGPUPass) {
+    hdrTransferFuncInverseGPUPass = new WGPUComputePass(
+      'hdrTransferFunc',
+      device,
+      {
+        inputs: ['color'],
+        outputs: ['color'],
+        uniforms: [
+          {
+            label: 'inputScale',
+            type: 'f32',
+            data: new Float32Array([1])
+          }
+        ],
+        csDefine: /* wgsl */ `
+${constsCode}
+fn PUInverse(y: f32) -> f32 {
+  if (y <= x0) {
+    return y / a;
+  } else if (y <= x1) {
+    return pow((y - d) / b, 1 / c);
+  } else {
+    return exp((y - g) / e) - f;
+  }
+}
+`,
+        csMain: /* wgsl */ `
+let col = color[global_id] * rcpNormScale;
+out_color = vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale;
+`
+      }
+    );
+  }
 }
