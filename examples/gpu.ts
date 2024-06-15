@@ -75,8 +75,12 @@ function createDisplayPass(device: GPUDevice) {
     outputs: ['color'],
     uniforms: [],
     fsMain: /*wgsl*/ `
-var color = textureLoad(colorTex, uv, 0);
-output.color = color;
+let color = textureLoad(colorTex, uv, 0);
+let v = color.rgb;
+output.color = vec4(
+  pow((v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14), vec3(1 / 2.2)),
+  1.0
+);
 `
   });
   return displayPass;

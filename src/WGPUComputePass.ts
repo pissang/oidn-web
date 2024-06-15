@@ -256,7 +256,7 @@ ${this._csMain}
               resource: {
                 buffer: this._uniformBuffers[uniform.label]
               }
-            } satisfies GPUBindGroupEntry)
+            } as GPUBindGroupEntry)
         )
       });
     }

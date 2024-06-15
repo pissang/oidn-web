@@ -93,7 +93,6 @@ const minTileAlignment = 1;
 
 const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
 
-const maxTileSize = 512;
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
 class UNet {
   private _tfModel: LayersModel | undefined;
@@ -112,16 +111,21 @@ class UNet {
 
   private _dataProcessGPU?: GPUDataProcess;
 
+  private _maxTileSize = 512;
+
   constructor(
     private _tensors: Map<string, HostTensor>,
     private _backend: WebGPUBackend,
     opts: {
       aux?: boolean;
       hdr?: boolean;
+      maxTileSize?: number;
     } = {}
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
+
+    this._maxTileSize = opts.maxTileSize ?? 512;
 
     this._device = this._backend.device;
   }
@@ -255,6 +259,7 @@ class UNet {
   }
 
   private _updateModel(width: number, height: number) {
+    const maxTileSize = this._maxTileSize;
     let tileWidth = maxTileSize;
     let tileHeight = maxTileSize;
     let tileOverlapX = defaultTileOverlap;
