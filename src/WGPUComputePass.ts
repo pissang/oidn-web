@@ -128,7 +128,9 @@ export class WGPUComputePass<I extends string, O extends string> {
   }
 
   private _createBuffer(params: WGPUComputePassOutput) {
-    const byteLength = this._width * this._height * params.channels * 4;
+    // const byteLength = this._width * this._height * params.channels * 4;
+    // Buffer data can only be 4 channels?
+    const byteLength = this._width * this._height * 4 * 4;
     return this._device.createBuffer({
       label: this._label,
       // webgpu needs buffer at least 80 bytes.
