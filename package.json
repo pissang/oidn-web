@@ -5,7 +5,11 @@
   "main": "index.js",
   "scripts": {
     "build": "vite build",
-    "dev": "vite dev"
+    "dev": "vite dev",
+    "watch": "vite build -w",
+    "prepublishOnly": "npm run build && npm run build:lib",
+    "build:lib": "tsc",
+    "watch:lib": "tsc --watch"
   },
   "author": "pissang",
   "license": "MIT",

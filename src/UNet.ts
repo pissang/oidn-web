@@ -111,7 +111,7 @@ class UNet {
 
   private _dataProcessGPU?: GPUDataProcess;
 
-  private _maxTileSize = 512;
+  private _maxTileSize;
 
   constructor(
     private _tensors: Map<string, HostTensor>,
@@ -696,6 +696,7 @@ class UNet {
 
   dispose() {
     this._tfModel?.dispose();
+    this._dataProcessGPU?.dispose();
   }
 }
 

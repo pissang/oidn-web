@@ -335,4 +335,9 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
 
     return outputGPUPass.getOutputBuffer('color');
   }
+
+  dispose() {
+    this._outputPass.dispose();
+    this._inputPass.dispose();
+  }
 }
