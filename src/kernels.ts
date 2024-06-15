@@ -4,6 +4,7 @@ import {
 } from '@tensorflow/tfjs-core/dist/kernel_registry';
 
 import { mirrorPadConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/MirrorPad';
+import { padV2Config } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/PadV2';
 import { sliceConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/Slice';
 import { fusedConv2DConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/FusedConv2D';
 import { maxPoolConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/MaxPool';
@@ -13,6 +14,7 @@ import { identityConfig } from '@tensorflow/tfjs-backend-webgpu/dist/kernels/Ide
 
 const kernelConfigs: KernelConfig[] = [
   mirrorPadConfig,
+  padV2Config,
   sliceConfig,
   fusedConv2DConfig,
   maxPoolConfig,

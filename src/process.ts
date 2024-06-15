@@ -311,15 +311,17 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
   }
 
   inverse(buffer: GPUBuffer) {
+    const device = this._device;
+
+    const commandEncoder = device.createCommandEncoder();
     const outputGPUPass = this._outputPass;
     // TODO input scale
     outputGPUPass.setOutputParams({
       color: { channels: 4 }
     });
 
-    const commandEncoder = this._device.createCommandEncoder();
     outputGPUPass.createPass(commandEncoder, {
-      color: { buffer, channels: 3 }
+      color: { buffer: buffer, channels: 4 }
     });
     this._device.queue.submit([commandEncoder.finish()]);
 

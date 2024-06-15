@@ -4,6 +4,8 @@ import type { SymbolicTensor } from '@tensorflow/tfjs-layers';
 import { tensor } from '@tensorflow/tfjs-core/dist/ops/tensor';
 import { tensor1d } from '@tensorflow/tfjs-core/dist/ops/tensor1d';
 import { mirrorPad } from '@tensorflow/tfjs-core/dist/ops/mirror_pad';
+import { pad4d } from '@tensorflow/tfjs-core/dist/ops/pad4d';
+import { slice4d } from '@tensorflow/tfjs-core/dist/ops/slice4d';
 import { concat4d } from '@tensorflow/tfjs-core/dist/ops/concat_4d';
 import {
   Conv2D,
@@ -91,7 +93,7 @@ const minTileAlignment = 1;
 
 const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
 
-const maxTileSize = 512;
+const maxTileSize = 1024;
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
 class UNet {
   private _tfModel: LayersModel | undefined;
@@ -469,13 +471,17 @@ class UNet {
         inputData.albedo,
         inputData.normal
       );
-      const shape = [1, srcTileHeight, srcTileWidth, 3] as any;
+      const shape = [1, srcTileHeight, srcTileWidth, 4] as any;
+
       tileTensor = concat4d(
-        [
-          tensor({ buffer: color, zeroCopy: true }, shape),
-          tensor({ buffer: albedo, zeroCopy: true }, shape),
-          tensor({ buffer: normal, zeroCopy: true }, shape)
-        ],
+        [color, albedo, normal].map((buffer) => {
+          const tmp = tensor({ buffer, zeroCopy: true }, shape) as Tensor4D;
+          return slice4d(
+            tmp,
+            [0, 0, 0, 0],
+            [1, srcTileHeight, srcTileWidth, 3]
+          );
+        }),
         3
       );
     }
@@ -541,10 +547,20 @@ class UNet {
           dstTile.height
         )
       );
+      // IMPORTANT
+      // storage buffer has alignment. that 3 channels still needs 16 bytes data.
+      // So we need to pad it to 4 channels.
+      const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 1]
+      ]);
       const outBuffer = dataProcessGPU!.inverse(
-        outputTensor.dataToGPU().buffer!
+        outputTensor4Channnels.dataToGPU().buffer!
       );
       outputTensor.dispose();
+      outputTensor4Channnels.dispose();
       return outBuffer;
     }
   }

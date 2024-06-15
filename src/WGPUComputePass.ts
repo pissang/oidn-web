@@ -129,7 +129,7 @@ export class WGPUComputePass<I extends string, O extends string> {
 
   private _createBuffer(params: WGPUComputePassOutput) {
     // const byteLength = this._width * this._height * params.channels * 4;
-    // Buffer data can only be 4 channels?
+    // Buffer data needs to be aligned with 8, 16
     const byteLength = this._width * this._height * 4 * 4;
     return this._device.createBuffer({
       label: this._label,

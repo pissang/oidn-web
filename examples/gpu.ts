@@ -90,10 +90,8 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
     loadImage('./test/test4_albedo.png'),
     loadImage('./test/test4_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
-    // const w = colorData.width;
-    // const h = colorData.height;
-    const w = 512;
-    const h = 512;
+    const w = colorData.width;
+    const h = colorData.height;
     rawCtx.canvas.width = w;
     rawCtx.canvas.height = h;
     denoisedCtx.canvas.width = w;
