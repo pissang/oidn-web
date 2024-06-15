@@ -25,7 +25,7 @@ import {
   hdrTransferFuncInverseCPU
 } from './process';
 import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
-import { profileAndLogKernelCode } from './helper';
+// import { profileAndLogKernelCode } from './helper';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -642,24 +642,24 @@ class UNet {
         return;
       }
       let resGPUBuffer;
-      profileAndLogKernelCode(() => {
-        resGPUBuffer = this._executeTile(
-          isGPUImageData(color)
-            ? {
-                color: color.data,
-                albedo: (albedo as GPUImageData).data,
-                normal: (normal as GPUImageData).data
-              }
-            : rawData,
-          outputTileData,
-          outputImageData,
-          i,
-          j,
-          width,
-          height,
-          hdr
-        );
-      }, true);
+      // profileAndLogKernelCode(() => {
+      resGPUBuffer = this._executeTile(
+        isGPUImageData(color)
+          ? {
+              color: color.data,
+              albedo: (albedo as GPUImageData).data,
+              normal: (normal as GPUImageData).data
+            }
+          : rawData,
+        outputTileData,
+        outputImageData,
+        i,
+        j,
+        width,
+        height,
+        hdr
+      );
+      // }, true);
       const output = outputImageData || {
         data: resGPUBuffer,
         width,
