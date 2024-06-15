@@ -541,14 +541,7 @@ class UNet {
 
       outputTensor.dispose();
     } else {
-      dataProcessGPU!.setOutputTile(
-        new Tile(
-          dstTile.x - srcTile.x,
-          dstTile.y - srcTile.y,
-          dstTile.width,
-          dstTile.height
-        )
-      );
+      dataProcessGPU!.setOutputTile(dstTile, srcTile);
       // IMPORTANT
       // storage buffer has alignment. that 3 channels still needs 16 bytes data.
       // So we need to pad it to 4 channels.
