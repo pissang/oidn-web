@@ -297,9 +297,9 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
 
     const commandEncoder = this._device.createCommandEncoder();
     inputGPUPass.createPass(commandEncoder, {
-      color: colorBuffer,
-      albedo: albedoBuffer,
-      normal: normalBuffer
+      color: { buffer: colorBuffer, channels: 4 },
+      albedo: { buffer: albedoBuffer, channels: 4 },
+      normal: { buffer: normalBuffer, channels: 4 }
     });
     this._device.queue.submit([commandEncoder.finish()]);
 
@@ -319,7 +319,7 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
 
     const commandEncoder = this._device.createCommandEncoder();
     outputGPUPass.createPass(commandEncoder, {
-      color: buffer
+      color: { buffer, channels: 3 }
     });
     this._device.queue.submit([commandEncoder.finish()]);
 

@@ -12,6 +12,10 @@ export interface Uniform {
   type: string;
   data: Float32Array | Int32Array | Uint32Array;
 }
+export interface WGPUComputePassInput {
+  buffer: GPUBuffer;
+  channels: number;
+}
 
 export interface WGPUComputePassOutput {
   channels: number;
@@ -35,7 +39,6 @@ export class WGPUComputePass<I extends string, O extends string> {
 
   private _inputs: string[] = [];
   private _outputs: string[] = [];
-  private _outputsParams: Record<string, WGPUComputePassOutput> = {};
   private _uniforms: Uniform[] = [];
   private _uniformBuffers: Record<string, GPUBuffer> = {};
 
@@ -102,7 +105,6 @@ export class WGPUComputePass<I extends string, O extends string> {
   }
 
   setOutputParams(outputParams: Record<O, WGPUComputePassOutput>) {
-    this._outputsParams = outputParams;
     this._updateOutputBuffers(outputParams);
     this._needsUpdatePipeline = true;
   }
@@ -139,11 +141,11 @@ export class WGPUComputePass<I extends string, O extends string> {
   }
 
   private _resizeOutputBuffers() {
-    const outputTextures = this._outputBuffers;
-    for (const key in outputTextures) {
-      const { buffer, params } = outputTextures[key];
+    const outputBuffers = this._outputBuffers;
+    for (const key in outputBuffers) {
+      const { buffer, params } = outputBuffers[key];
       buffer.destroy();
-      outputTextures[key].buffer = this._createBuffer(params);
+      outputBuffers[key].buffer = this._createBuffer(params);
     }
   }
 
@@ -169,13 +171,13 @@ export class WGPUComputePass<I extends string, O extends string> {
     }
   }
 
-  private _updatePipeline() {
+  private _updatePipeline(inputParams: Record<string, WGPUComputePassInput>) {
     if (!this._needsUpdatePipeline) {
       return;
     }
     this._needsUpdatePipeline = false;
     const device = this._device;
-    const csCode = this._getFullCs();
+    const csCode = this._getFullCs(inputParams);
     if (csCode === this._csCode) {
       return;
     }
@@ -194,7 +196,7 @@ export class WGPUComputePass<I extends string, O extends string> {
     this._updateBindGroups();
   }
 
-  private _getFullCs() {
+  private _getFullCs(inputParams: Record<string, WGPUComputePassInput>) {
     const inputs = this._inputs;
     const hasInputs = inputs.length > 0;
     const cs = `
@@ -203,7 +205,7 @@ ${inputs
   .map(
     (bufferName, idx) =>
       // TODO more channels option.
-      `@group(0) @binding(${idx}) var<storage, read> in_${bufferName}: array<vec4f>;`
+      `@group(0) @binding(${idx}) var<storage, read> in_${bufferName}: array<vec${inputParams[bufferName].channels}f>;`
   )
   .join('\n')}
 ${this._uniforms
@@ -221,7 +223,7 @@ ${this._outputs
       `@group(${
         hasInputs ? 2 : 1
       }) @binding(${idx}) var<storage, read_write> out_${name}: array<vec${
-        this._outputsParams[name].channels
+        this._outputBuffers[name].params.channels
       }f>;`
   )
   .join('\n')}
@@ -262,9 +264,9 @@ ${this._csMain}
 
   createPass(
     commandEncoder: GPUCommandEncoder,
-    inputBuffers: Record<I, GPUBuffer>
+    inputBuffers: Record<I, WGPUComputePassInput>
   ) {
-    this._updatePipeline();
+    this._updatePipeline(inputBuffers);
 
     const hasInputs = this._inputs.length > 0;
     // TODO createBindGroup every time?
@@ -276,7 +278,7 @@ ${this._csMain}
           binding: idx,
           // TODO
           resource: {
-            buffer: inputBuffers[bufferName as I]
+            buffer: inputBuffers[bufferName as I].buffer
           }
         }))
       });
