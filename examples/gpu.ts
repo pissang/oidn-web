@@ -1,12 +1,13 @@
 import { initUNetFromModelPath } from '../src/main';
 import { readHDR } from '../src/hdr';
+import { WGPUFullQuadPass } from '../src/WGPUFullQuadPass';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
   '2d'
 )!;
 const denoisedCtx = (
   document.getElementById('denoised') as HTMLCanvasElement
-).getContext('2d')!;
+).getContext('webgpu')!;
 
 function loadHDR(url: string) {
   return fetch(url)
@@ -68,7 +69,18 @@ function convertHDRDataToImageData(hdrData: {
   return new ImageData(newData, width, height);
 }
 
-const displayPass = new WGPUFullQuadPass();
+function createDisplayPass(device: GPUDevice) {
+  const displayPass = new WGPUFullQuadPass('display', device, {
+    inputs: ['colorTex'],
+    outputs: ['color'],
+    uniforms: [],
+    fsMain: /*wgsl*/ `
+var color = textureLoad(colorTex, uv, 0);
+output.color = color;
+`
+  });
+  return displayPass;
+}
 
 initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true
@@ -78,8 +90,10 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
     loadImage('./test/test4_albedo.png'),
     loadImage('./test/test4_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
-    const w = colorData.width;
-    const h = colorData.height;
+    // const w = colorData.width;
+    // const h = colorData.height;
+    const w = 512;
+    const h = 512;
     rawCtx.canvas.width = w;
     rawCtx.canvas.height = h;
     denoisedCtx.canvas.width = w;
@@ -103,17 +117,22 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       normF32Array[i] = normF32Array[i] / 255;
     }
     const device = unet.getDevice();
+    const size = colorData.data.byteLength;
+    const usage =
+      GPUBufferUsage.COPY_DST |
+      GPUBufferUsage.COPY_SRC |
+      GPUBufferUsage.STORAGE;
     const colorBuffer = device.createBuffer({
-      size: colorData.data.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
+      size,
+      usage
     });
     const albedoBuffer = device.createBuffer({
-      size: albedoF32Array.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
+      size,
+      usage
     });
     const normalBuffer = device.createBuffer({
-      size: normF32Array.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
+      size,
+      usage
     });
     device.queue.writeBuffer(colorBuffer, 0, colorData.data);
     device.queue.writeBuffer(albedoBuffer, 0, albedoF32Array);
@@ -124,8 +143,6 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       normal: { data: normalBuffer, width: w, height: h },
       hdr: true,
       done(finalBuffer) {
-        console.timeEnd('denoising');
-
         const texture = device!.createTexture({
           size: { width: w, height: h, depthOrArrayLayers: 1 },
           format: 'rgba32float',
@@ -133,10 +150,30 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
         });
         const commandEncoder = device.createCommandEncoder();
         commandEncoder.copyBufferToTexture(
-          { buffer: finalBuffer.data, bytesPerRow: 4 * w },
+          { buffer: finalBuffer.data, bytesPerRow: 16 * w },
           { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
           { width: w, height: h, depthOrArrayLayers: 1 }
         );
+
+        const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
+        denoisedCtx.configure({
+          device,
+          format: presentationFormat,
+          alphaMode: 'premultiplied'
+        });
+        const displayPass = createDisplayPass(device);
+        displayPass.setRenderToScreen(
+          denoisedCtx.getCurrentTexture(),
+          presentationFormat
+        );
+        displayPass.createPass(commandEncoder, {
+          colorTex: texture
+        });
+        device!.queue.submit([commandEncoder.finish()]);
+
+        requestAnimationFrame(() => {
+          console.timeEnd('denoising');
+        });
       },
       progress(tileData, _, tile) {}
     });

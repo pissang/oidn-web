@@ -143,7 +143,7 @@ export class GPUDataProcess {
   private _inputPass;
   private _outputPass;
   constructor(private _device: GPUDevice) {
-    this._inputPass = new WGPUComputePass('hdrTransferFunc', this._device, {
+    this._inputPass = new WGPUComputePass('inputPass', this._device, {
       inputs: ['color', 'albedo', 'normal'],
       outputs: ['color', 'albedo', 'normal'],
       uniforms: [
@@ -155,17 +155,17 @@ export class GPUDataProcess {
         {
           label: 'inputSize',
           type: 'vec2<f32>',
-          data: new Float32Array([1, 1])
+          data: new Float32Array(2)
         },
         {
           label: 'outputSize',
           type: 'vec2<f32>',
-          data: new Float32Array([1, 1])
+          data: new Float32Array(2)
         },
         {
           label: 'inputOffset',
           type: 'vec2<f32>',
-          data: new Float32Array([0, 0])
+          data: new Float32Array(2)
         }
       ],
       csDefine: /* wgsl */ `
@@ -195,7 +195,7 @@ out_albedo[outIdx] = alb.rgb;
 `
     });
 
-    this._outputPass = new WGPUComputePass('hdrTransferFunc', this._device, {
+    this._outputPass = new WGPUComputePass('outputPass', this._device, {
       inputs: ['color'],
       outputs: ['color'],
       uniforms: [
@@ -207,27 +207,27 @@ out_albedo[outIdx] = alb.rgb;
         {
           label: 'inputSize',
           type: 'vec2<f32>',
-          data: new Float32Array([1, 1])
+          data: new Float32Array(2)
         },
         {
           label: 'outputSize',
           type: 'vec2<f32>',
-          data: new Float32Array([1, 1])
+          data: new Float32Array(2)
         },
         {
           label: 'imageSize',
           type: 'vec2<f32>',
-          data: new Float32Array([1, 1])
+          data: new Float32Array(2)
         },
         {
           label: 'inputOffset',
           type: 'vec2<f32>',
-          data: new Float32Array([0, 0])
+          data: new Float32Array(2)
         },
         {
           label: 'outputOffset',
           type: 'vec2<f32>',
-          data: new Float32Array([0, 0])
+          data: new Float32Array(2)
         }
       ],
       csDefine: /* wgsl */ `
@@ -249,7 +249,7 @@ if (x >= outputSize.x || y >= outputSize.y) {
   return;
 }
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
-let outIdx = i32((y + outputOffset.y) * imageSize.x + (x + outputOffset.y));
+let outIdx = i32((y + outputOffset.y) * imageSize.x + (x + outputOffset.x));
 let col = in_color[inIdx] * rcpNormScale;
 // TODO alpha
 out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale, 1.0);
@@ -301,7 +301,7 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
       albedo: albedoBuffer,
       normal: normalBuffer
     });
-    commandEncoder.finish();
+    this._device.queue.submit([commandEncoder.finish()]);
 
     return {
       color: inputGPUPass.getOutputBuffer('color'),
@@ -321,7 +321,7 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
     outputGPUPass.createPass(commandEncoder, {
       color: buffer
     });
-    commandEncoder.finish();
+    this._device.queue.submit([commandEncoder.finish()]);
 
     return outputGPUPass.getOutputBuffer('color');
   }
