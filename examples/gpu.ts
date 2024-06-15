@@ -68,6 +68,8 @@ function convertHDRDataToImageData(hdrData: {
   return new ImageData(newData, width, height);
 }
 
+const displayPass = new WGPUFullQuadPass();
+
 initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
@@ -94,26 +96,28 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
 
     console.time('denoising');
 
+    const albedoF32Array = new Float32Array(albedoData.data);
+    const normF32Array = new Float32Array(normData.data);
+    for (let i = 0; i < albedoF32Array.length; i++) {
+      albedoF32Array[i] /= 255;
+      normF32Array[i] = normF32Array[i] / 255;
+    }
     const device = unet.getDevice();
     const colorBuffer = device.createBuffer({
       size: colorData.data.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_WRITE
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
     });
     const albedoBuffer = device.createBuffer({
-      size: albedoData.data.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_WRITE
+      size: albedoF32Array.byteLength,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
     });
     const normalBuffer = device.createBuffer({
-      size: normData.data.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_WRITE
+      size: normF32Array.byteLength,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE
     });
     device.queue.writeBuffer(colorBuffer, 0, colorData.data);
-    device.queue.writeBuffer(
-      albedoBuffer,
-      0,
-      new Float32Array(albedoData.data)
-    );
-    device.queue.writeBuffer(normalBuffer, 0, new Float32Array(normData.data));
+    device.queue.writeBuffer(albedoBuffer, 0, albedoF32Array);
+    device.queue.writeBuffer(normalBuffer, 0, normF32Array);
     abortDenoising = unet.progressiveExecute({
       color: { data: colorBuffer, width: w, height: h },
       albedo: { data: albedoBuffer, width: w, height: h },
@@ -122,18 +126,17 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       done(finalBuffer) {
         console.timeEnd('denoising');
 
-        finalBuffer.data.mapAsync(GPUMapMode.READ).then((mapped) => {
-          denoisedCtx.putImageData(
-            convertHDRDataToImageData({
-              data: new Float32Array(finalBuffer.data.getMappedRange()),
-              width: w,
-              height: h
-            }),
-            0,
-            0
-          );
-          finalBuffer.data.unmap();
+        const texture = device!.createTexture({
+          size: { width: w, height: h, depthOrArrayLayers: 1 },
+          format: 'rgba32float',
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
         });
+        const commandEncoder = device.createCommandEncoder();
+        commandEncoder.copyBufferToTexture(
+          { buffer: finalBuffer.data, bytesPerRow: 4 * w },
+          { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+          { width: w, height: h, depthOrArrayLayers: 1 }
+        );
       },
       progress(tileData, _, tile) {}
     });

@@ -266,8 +266,9 @@ ${this._csMain}
   ) {
     this._updatePipeline();
 
+    const hasInputs = this._inputs.length > 0;
     // TODO createBindGroup every time?
-    if (this._inputs.length > 0) {
+    if (hasInputs) {
       this._bindGroups[0] = this._device.createBindGroup({
         label: this._label,
         layout: this._pipeline.getBindGroupLayout(0),
@@ -280,6 +281,19 @@ ${this._csMain}
         }))
       });
     }
+
+    // Outputs
+    this._bindGroups[hasInputs ? 2 : 1] = this._device.createBindGroup({
+      label: this._label,
+      layout: this._pipeline.getBindGroupLayout(hasInputs ? 2 : 1),
+      entries: this._outputs.map((bufferName, idx) => ({
+        binding: idx,
+        resource: {
+          buffer: this._outputBuffers[bufferName].buffer
+        }
+      }))
+    });
+
     // Begin the render pass
     const computePass = commandEncoder.beginComputePass();
 

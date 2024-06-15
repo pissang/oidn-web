@@ -251,7 +251,8 @@ if (x >= outputSize.x || y >= outputSize.y) {
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
 let outIdx = i32((y + outputOffset.y) * imageSize.x + (x + outputOffset.y));
 let col = in_color[inIdx] * rcpNormScale;
-out_color[outIdx] = vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale;
+// TODO alpha
+out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale, 1.0);
 `
     });
   }
