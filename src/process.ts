@@ -200,6 +200,7 @@ out_albedo[outIdx] = alb.rgb;
       outputs: ['color'],
       uniforms: [
         {
+          // TODO inputScale from avg log lum
           label: 'inputScale',
           type: 'f32',
           data: new Float32Array([1])

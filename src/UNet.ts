@@ -93,7 +93,7 @@ const minTileAlignment = 1;
 
 const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
 
-const maxTileSize = 1024;
+const maxTileSize = 512;
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
 class UNet {
   private _tfModel: LayersModel | undefined;
@@ -476,11 +476,13 @@ class UNet {
       tileTensor = concat4d(
         [color, albedo, normal].map((buffer) => {
           const tmp = tensor({ buffer, zeroCopy: true }, shape) as Tensor4D;
-          return slice4d(
+          const ret = slice4d(
             tmp,
             [0, 0, 0, 0],
             [1, srcTileHeight, srcTileWidth, 3]
           );
+          tmp.dispose();
+          return ret;
         }),
         3
       );
