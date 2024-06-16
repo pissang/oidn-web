@@ -471,6 +471,10 @@ class UNet {
       }
       dataProcessGPU.setImageSize(width, height);
       dataProcessGPU.setInputTile(srcTile);
+      // Display the noisy input instead of prev denoised result
+      if (i === 0 && j === 0) {
+        dataProcessGPU.copyInputDataToOutput(inputData.color);
+      }
       const { color, albedo, normal } = dataProcessGPU.forward(
         inputData.color,
         inputData.albedo,

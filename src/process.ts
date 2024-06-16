@@ -256,6 +256,17 @@ let col = in_color[inIdx] * rcpNormScale;
 out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale, 1.0);
 `
     });
+
+    // TODO input scale
+    this._inputPass.setOutputParams({
+      color: { channels: 3 },
+      albedo: { channels: 3 },
+      normal: { channels: 3 }
+    });
+    // TODO input scale
+    this._outputPass.setOutputParams({
+      color: { channels: 4 }
+    });
   }
 
   setImageSize(w: number, h: number) {
@@ -296,13 +307,6 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
     normalBuffer: GPUBuffer
   ) {
     const inputGPUPass = this._inputPass;
-    // TODO input scale
-    inputGPUPass.setOutputParams({
-      color: { channels: 3 },
-      albedo: { channels: 3 },
-      normal: { channels: 3 }
-    });
-
     const commandEncoder = this._device.createCommandEncoder();
     inputGPUPass.createPass(commandEncoder, {
       color: { buffer: colorBuffer, channels: 4 },
@@ -323,10 +327,6 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
 
     const commandEncoder = device.createCommandEncoder();
     const outputGPUPass = this._outputPass;
-    // TODO input scale
-    outputGPUPass.setOutputParams({
-      color: { channels: 4 }
-    });
 
     outputGPUPass.createPass(commandEncoder, {
       color: { buffer: buffer, channels: 4 }
@@ -334,6 +334,21 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
     this._device.queue.submit([commandEncoder.finish()]);
 
     return outputGPUPass.getOutputBuffer('color');
+  }
+
+  copyInputDataToOutput(inputColorBuffer: GPUBuffer) {
+    const encoder = this._device.createCommandEncoder();
+    const outputGPUPass = this._outputPass;
+    const colorBuffer = outputGPUPass.getOutputBuffer('color');
+    encoder.copyBufferToBuffer(
+      inputColorBuffer,
+      0,
+      colorBuffer,
+      0,
+      colorBuffer.size
+    );
+
+    this._device.queue.submit([encoder.finish()]);
   }
 
   dispose() {
