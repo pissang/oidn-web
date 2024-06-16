@@ -87,7 +87,8 @@ output.color = vec4(
 }
 
 initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
-  aux: true
+  aux: true,
+  hdr: true
 }).then((unet) => {
   Promise.all([
     loadHDR('./test/test4_color.hdr'),

@@ -569,14 +569,12 @@ class UNet {
     color,
     albedo,
     normal,
-    hdr,
     done,
     progress
   }: {
     color: T;
     albedo?: ImageData | GPUImageData;
     normal?: ImageData | GPUImageData;
-    hdr?: boolean;
     done: (outputData: T) => void;
     progress?: (
       tileData: T | undefined,
@@ -603,7 +601,7 @@ class UNet {
     // TODO should fixed to be hdr when UNet is created.
     // weights of hdr and ldr is different
 
-    hdr = hdr || false;
+    const hdr = this._hdr || false;
     let rawData: Float32Array;
     if (!isGPUImageData(color)) {
       rawData = this._processImageData(

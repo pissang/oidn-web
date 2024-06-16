@@ -69,7 +69,8 @@ function convertHDRDataToImageData(hdrData: {
 }
 
 initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
-  aux: true
+  aux: true,
+  hdr: true
 }).then((unet) => {
   Promise.all([
     loadHDR('./test/test4_color.hdr'),
@@ -97,7 +98,6 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       color: colorData,
       albedo: albedoData,
       normal: normData,
-      hdr: true,
       done() {
         console.timeEnd('denoising');
       },
