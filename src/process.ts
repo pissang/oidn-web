@@ -196,7 +196,7 @@ out_albedo[outIdx] = alb.rgb;
     });
 
     this._outputPass = new WGPUComputePass('outputPass', this._device, {
-      inputs: ['color'],
+      inputs: ['color', 'raw'],
       outputs: ['color'],
       uniforms: [
         {
@@ -249,11 +249,15 @@ let y = f32(globalId.y);
 if (x >= outputSize.x || y >= outputSize.y) {
   return;
 }
-let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
-let outIdx = i32((y + outputOffset.y) * imageSize.x + (x + outputOffset.x));
+let inIdx = i32((y + inputOffset.y) * inputSize.x + x + inputOffset.x);
+let outIdx = i32((y + outputOffset.y) * imageSize.x + x + outputOffset.x);
 let col = in_color[inIdx] * rcpNormScale;
-// TODO alpha
-out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale, 1.0);
+let raw = in_raw[outIdx];
+out_color[outIdx] = vec4f(
+  vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale,
+  // Pick the alpha
+  raw.a
+);
 `
     });
 
@@ -321,14 +325,15 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
     };
   }
 
-  inverse(buffer: GPUBuffer) {
+  inverse(buffer: GPUBuffer, raw: GPUBuffer) {
     const device = this._device;
 
     const commandEncoder = device.createCommandEncoder();
     const outputGPUPass = this._outputPass;
 
     outputGPUPass.createPass(commandEncoder, {
-      color: { buffer: buffer, channels: 4 }
+      color: { buffer: buffer, channels: 4 },
+      raw: { buffer: raw, channels: 4 }
     });
     this._device.queue.submit([commandEncoder.finish()]);
 

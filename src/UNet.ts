@@ -563,7 +563,8 @@ class UNet {
         [0, 1]
       ]);
       const outBuffer = dataProcessGPU!.inverse(
-        outputTensor4Channnels.dataToGPU().buffer!
+        outputTensor4Channnels.dataToGPU().buffer!,
+        inputData.color
       );
       outputTensor.dispose();
       outputTensor4Channnels.dispose();

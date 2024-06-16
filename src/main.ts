@@ -11,6 +11,7 @@ export async function initUNEtFromModelBuffer(
   opts?: {
     aux?: boolean;
     hdr?: boolean;
+    maxTileSize?: number;
   }
 ) {
   const backend = await (backendParams
@@ -30,6 +31,7 @@ export async function initUNetFromModelPath(
   opts?: {
     aux?: boolean;
     hdr?: boolean;
+    maxTileSize?: number;
   }
 ) {
   return fetch(modelPath)
