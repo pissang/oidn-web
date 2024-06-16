@@ -288,11 +288,10 @@ out_color[outIdx] = vec4f(vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(co
   setOutputTile(dstTile: Tile, srcTile: Tile) {
     const outputPass = this._outputPass;
     const size = new Float32Array([dstTile.width, dstTile.height]);
+    const dx = dstTile.x - srcTile.x;
+    const dy = dstTile.y - srcTile.y;
     outputPass.setUniform('outputSize', size);
-    outputPass.setUniform(
-      'inputOffset',
-      new Float32Array([dstTile.x - srcTile.x, dstTile.y - srcTile.y])
-    );
+    outputPass.setUniform('inputOffset', new Float32Array([dx, dy]));
     outputPass.setUniform(
       'outputOffset',
       new Float32Array([dstTile.x, dstTile.y])

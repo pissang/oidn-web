@@ -518,6 +518,8 @@ class UNet {
     const dstWidth = Math.min(dstTileSize.width, width);
     const dstHeight = Math.min(dstTileSize.height, height);
     const dstTile = new Tile(i * dstWidth, j * dstHeight, dstWidth, dstHeight);
+    dstTile.width = Math.min(dstTile.width, width - dstTile.x);
+    dstTile.height = Math.min(dstTile.height, height - dstTile.y);
 
     if (inputData instanceof Float32Array) {
       let denoisedData = outputTensor.dataSync();
