@@ -101,7 +101,7 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       done() {
         console.timeEnd('denoising');
       },
-      progress(tileData, _, tile) {
+      progress(_, tileData, tile) {
         denoisedCtx.putImageData(
           convertHDRDataToImageData(tileData),
           tile.x,

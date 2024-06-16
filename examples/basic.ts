@@ -35,7 +35,7 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
       console.timeEnd('denoising');
       // denoisedCtx.putImageData(denoised, 0, 0);
     },
-    progress(tileData, _, tile) {
+    progress(_, tileData, tile) {
       denoisedCtx.putImageData(tileData, tile.x, tile.y);
     }
   });

@@ -53,7 +53,7 @@ initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', undefined, {
       done() {
         console.timeEnd('denoising');
       },
-      progress(tileData, _, tile) {
+      progress(_, tileData, tile) {
         denoisedCtx.putImageData(tileData, tile.x, tile.y);
       }
     });

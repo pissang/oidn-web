@@ -144,13 +144,12 @@ initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
       color: { data: colorBuffer, width: w, height: h },
       albedo: { data: albedoBuffer, width: w, height: h },
       normal: { data: normalBuffer, width: w, height: h },
-      hdr: true,
       done(finalBuffer) {
         requestAnimationFrame(() => {
           console.timeEnd('denoising');
         });
       },
-      progress(_, finalBuffer, tile) {
+      progress(finalBuffer) {
         const texture = device!.createTexture({
           size: { width: w, height: h, depthOrArrayLayers: 1 },
           format: 'rgba32float',

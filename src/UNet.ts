@@ -577,8 +577,8 @@ class UNet {
     normal?: ImageData | GPUImageData;
     done: (outputData: T) => void;
     progress?: (
-      tileData: T | undefined,
       outputData: T,
+      tileData: T | undefined,
       tile: Tile,
       currentIdx: number,
       totalIdx: number
@@ -664,9 +664,9 @@ class UNet {
         height
       };
       progress?.(
+        output as T,
         // Is undefined if using webgpu buffer
         outputTileData as T | undefined,
-        output as T,
         new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
         i + j * tileCountW,
         tileCountW * tileCountH
