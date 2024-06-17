@@ -1,4 +1,4 @@
-import { initUNetFromModelPath } from '../src/main';
+import { initUNetFromURL } from '../src/main';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
   '2d'
@@ -19,7 +19,7 @@ function loadImage(url: string) {
   });
 }
 
-initUNetFromModelPath('../weights/rt_ldr_alb_nrm.tza', undefined, {
+initUNetFromURL('../weights/rt_ldr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
   Promise.all([

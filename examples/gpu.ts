@@ -1,4 +1,4 @@
-import { initUNetFromModelPath } from '../src/main';
+import { initUNetFromURL } from '../src/main';
 import { readHDR } from '../src/hdr';
 import { WGPUFullQuadPass } from '../src/WGPUFullQuadPass';
 
@@ -86,7 +86,7 @@ output.color = vec4(
   return displayPass;
 }
 
-initUNetFromModelPath('../weights/rt_hdr_alb_nrm.tza', undefined, {
+initUNetFromURL('../weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true,
   hdr: true
 }).then((unet) => {

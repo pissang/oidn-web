@@ -5,7 +5,7 @@ import { initWebGPUBackend, initWebGPUBackendWithDevice } from './backend';
 
 export { parseTZA, UNet };
 
-export async function initUNEtFromModelBuffer(
+export async function initUNetFromBuffer(
   tzaBuffer: ArrayBuffer,
   backendParams?: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
   opts?: {
@@ -25,7 +25,7 @@ export async function initUNEtFromModelBuffer(
   return unet;
 }
 
-export async function initUNetFromModelPath(
+export async function initUNetFromURL(
   modelPath: string,
   backendParams?: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
   opts?: {
@@ -37,6 +37,6 @@ export async function initUNetFromModelPath(
   return fetch(modelPath)
     .then((res) => res.arrayBuffer())
     .then((ab) => {
-      return initUNEtFromModelBuffer(ab, backendParams, opts);
+      return initUNetFromBuffer(ab, backendParams, opts);
     });
 }

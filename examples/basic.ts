@@ -1,4 +1,4 @@
-import { UNet, initUNetFromModelPath } from '../src/main';
+import { UNet, initUNetFromURL } from '../src/main';
 
 const rawCtx = (document.getElementById('raw') as HTMLCanvasElement).getContext(
   '2d'
@@ -41,7 +41,7 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
   });
 }
 
-initUNetFromModelPath('../weights/rt_ldr.tza', undefined, {
+initUNetFromURL('../weights/rt_ldr.tza', undefined, {
   aux: false
 }).then((unet) => {
   const rawImage = new Image();
