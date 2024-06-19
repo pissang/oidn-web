@@ -481,20 +481,19 @@ class UNet {
         inputData.normal
       );
       const shape = [1, srcTileHeight, srcTileWidth, 4] as any;
+      const auxTensors = [color, albedo, normal].map((buffer) => {
+        const tmp = tensor({ buffer, zeroCopy: true }, shape) as Tensor4D;
+        const ret = slice4d(
+          tmp,
+          [0, 0, 0, 0],
+          [1, srcTileHeight, srcTileWidth, 3]
+        );
+        tmp.dispose();
+        return ret;
+      });
 
-      tileTensor = concat4d(
-        [color, albedo, normal].map((buffer) => {
-          const tmp = tensor({ buffer, zeroCopy: true }, shape) as Tensor4D;
-          const ret = slice4d(
-            tmp,
-            [0, 0, 0, 0],
-            [1, srcTileHeight, srcTileWidth, 3]
-          );
-          tmp.dispose();
-          return ret;
-        }),
-        3
-      );
+      tileTensor = concat4d(auxTensors, 3);
+      auxTensors.forEach((t) => t.dispose());
     }
     // We need resize if input size is smaller than tile size. And is rounded up.
     if (needsResize) {
