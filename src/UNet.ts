@@ -493,6 +493,7 @@ class UNet {
       });
 
       tileTensor = concat4d(auxTensors, 3);
+      // TODO reuse tensors?
       auxTensors.forEach((t) => t.dispose());
     }
     // We need resize if input size is smaller than tile size. And is rounded up.
