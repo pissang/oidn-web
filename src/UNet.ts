@@ -88,12 +88,15 @@ function isGPUImageData(
 }
 
 const receptiveField = 174; // receptive field in pixels
+const receptiveFieldLarge = 202;
 // TODO metal is 32?
 const minTileAlignment = 1;
 
 const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
 
 const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
+const defaultTileOverlapLarge = roundUp(receptiveFieldLarge / 2, tileAlignment);
+
 class UNet {
   private _tfModel: LayersModel | undefined;
   private _device: GPUDevice | undefined;
@@ -206,7 +209,7 @@ class UNet {
     return this._device;
   }
 
-  buildModel() {
+  private _buildModel(isLarge: boolean) {
     const aux = this._aux;
     const channels = 3 + (aux ? 6 : 0);
     const tileSize = this._getTileSizeWithOverlap();
@@ -218,52 +221,91 @@ class UNet {
       dtype: 'float32'
     });
 
-    const encConv0 = this._createConv('enc_conv0', input, 'relu');
-    const pool1 = this._createPooling(
-      this._createConv('enc_conv1', encConv0, 'relu')
-    );
-    const pool2 = this._createPooling(
-      this._createConv('enc_conv2', pool1, 'relu')
-    );
-    const pool3 = this._createPooling(
-      this._createConv('enc_conv3', pool2, 'relu')
-    );
-    const pool4 = this._createPooling(
-      this._createConv('enc_conv4', pool3, 'relu')
-    );
-    const encConv5a = this._createConv('enc_conv5a', pool4, 'relu');
-    const upsample4 = this._addUpsamplingLayer(
-      this._createConv('enc_conv5b', encConv5a, 'relu')
-    );
-    const decConv4a = this._createConcatConv('dec_conv4a', upsample4, pool3);
-    const upsample3 = this._addUpsamplingLayer(
-      this._createConv('dec_conv4b', decConv4a, 'relu')
-    );
-    const decConv3a = this._createConcatConv('dec_conv3a', upsample3, pool2);
-    const upsample2 = this._addUpsamplingLayer(
-      this._createConv('dec_conv3b', decConv3a, 'relu')
-    );
-    const decConv2a = this._createConcatConv('dec_conv2a', upsample2, pool1);
-    const upsample1 = this._addUpsamplingLayer(
-      this._createConv('dec_conv2b', decConv2a, 'relu')
-    );
-    const decConv1a = this._createConcatConv('dec_conv1a', upsample1, input);
-    const decConv1b = this._createConv('dec_conv1b', decConv1a, 'relu');
-    const decConv0 = this._createConv('dec_conv0', decConv1b, 'relu');
-
     this._tfModel = new LayersModel({
       inputs: [input],
       // TODO output process transferFunc
-      outputs: decConv0
+      outputs: isLarge ? this._addNetLarge(input) : this._addNet(input)
     });
   }
 
+  private _addNet(input: SymbolicTensor) {
+    let x = this._createConv('enc_conv0', input, 'relu');
+    const pool1 = (x = this._createPooling(
+      this._createConv('enc_conv1', x, 'relu')
+    ));
+    const pool2 = (x = this._createPooling(
+      this._createConv('enc_conv2', x, 'relu')
+    ));
+    const pool3 = (x = this._createPooling(
+      this._createConv('enc_conv3', x, 'relu')
+    ));
+    const pool4 = (x = this._createPooling(
+      this._createConv('enc_conv4', x, 'relu')
+    ));
+    x = this._createConv('enc_conv5a', pool4, 'relu');
+    x = this._addUpsamplingLayer(this._createConv('enc_conv5b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv4a', x, pool3);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv4b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv3a', x, pool2);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv3b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv2a', x, pool1);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv2b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv1a', x, input);
+    x = this._createConv('dec_conv1b', x, 'relu');
+    x = this._createConv('dec_conv0', x, 'relu');
+
+    return x;
+  }
+
+  private _addNetLarge(input: SymbolicTensor) {
+    let x = this._createConv('enc_conv1a', input, 'relu');
+    const pool1 = (x = this._createPooling(
+      this._createConv('enc_conv1b', x, 'relu')
+    ));
+    x = this._createConv('enc_conv2a', x, 'relu');
+    const pool2 = (x = this._createPooling(
+      this._createConv('enc_conv2b', x, 'relu')
+    ));
+    x = this._createConv('enc_conv3a', x, 'relu');
+    const pool3 = (x = this._createPooling(
+      this._createConv('enc_conv3b', x, 'relu')
+    ));
+    x = this._createConv('enc_conv4a', x, 'relu');
+    const pool4 = (x = this._createPooling(
+      this._createConv('enc_conv4b', x, 'relu')
+    ));
+
+    x = this._createConv('enc_conv5a', pool4, 'relu');
+    x = this._addUpsamplingLayer(this._createConv('enc_conv5b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv4a', x, pool3);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv4b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv3a', x, pool2);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv3b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv2a', x, pool1);
+    x = this._addUpsamplingLayer(this._createConv('dec_conv2b', x, 'relu'));
+
+    x = this._createConcatConv('dec_conv1a', x, input);
+    x = this._createConv('dec_conv1b', x, 'relu');
+    x = this._createConv('dec_conv1c', x, 'relu');
+
+    return x;
+  }
+
   private _updateModel(width: number, height: number) {
+    const isLarge = this._tensors.has('enc_conv1b.weight');
     const maxTileSize = this._maxTileSize;
+
     let tileWidth = maxTileSize;
     let tileHeight = maxTileSize;
-    let tileOverlapX = defaultTileOverlap;
-    let tileOverlapY = defaultTileOverlap;
+    let tileOverlapX = isLarge ? defaultTileOverlapLarge : defaultTileOverlap;
+    let tileOverlapY = isLarge ? defaultTileOverlapLarge : defaultTileOverlap;
 
     if (width < maxTileSize + defaultTileOverlap * 2) {
       tileWidth = roundUp(width, tileAlignment);
@@ -290,7 +332,7 @@ class UNet {
         this._tfModel.dispose();
       }
 
-      this.buildModel();
+      this._buildModel(isLarge);
     }
   }
 

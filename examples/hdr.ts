@@ -68,7 +68,7 @@ function convertHDRDataToImageData(hdrData: {
   return new ImageData(newData, width, height);
 }
 
-initUNetFromURL('../weights/rt_hdr_alb_nrm.tza', undefined, {
+initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
   aux: true,
   hdr: true
 }).then((unet) => {
