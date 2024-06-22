@@ -1,6 +1,6 @@
 {
   "name": "oidn-web",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Run Open Image Denoiser on the Web",
   "main": "lib/main.js",
   "scripts": {

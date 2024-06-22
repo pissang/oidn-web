@@ -86,7 +86,7 @@ output.color = vec4(
   return displayPass;
 }
 
-initUNetFromURL('../weights/rt_hdr_alb_nrm_small.tza', undefined, {
+initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
   aux: true,
   hdr: true
 }).then((unet) => {
