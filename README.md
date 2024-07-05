@@ -16,6 +16,10 @@ Currently it's only available on the browser with WebGPU enabled.
 
 ## How to Use
 
+[Basic Example](https://oidn-web-example.vercel.app/)
+
+[Example Code](https://github.com/pissang/oidn-web-example)
+
 ### Install
 
 ```shell
