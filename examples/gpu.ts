@@ -91,9 +91,9 @@ initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
   hdr: true
 }).then((unet) => {
   Promise.all([
-    loadHDR('./test/test4_color.hdr'),
-    loadImage('./test/test4_albedo.png'),
-    loadImage('./test/test4_norm.png')
+    loadHDR('./test/noisy.hdr'),
+    loadImage('./test/albedo.png'),
+    loadImage('./test/normal.png')
   ]).then(([colorData, albedoImage, normImage]) => {
     const w = colorData.width;
     const h = colorData.height;
@@ -140,7 +140,7 @@ initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
     device.queue.writeBuffer(colorBuffer, 0, colorData.data);
     device.queue.writeBuffer(albedoBuffer, 0, albedoF32Array);
     device.queue.writeBuffer(normalBuffer, 0, normF32Array);
-    abortDenoising = unet.progressiveExecute({
+    abortDenoising = unet.tileExecute({
       color: { data: colorBuffer, width: w, height: h },
       albedo: { data: albedoBuffer, width: w, height: h },
       normal: { data: normalBuffer, width: w, height: h },

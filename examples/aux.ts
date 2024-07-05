@@ -23,9 +23,9 @@ initUNetFromURL('../weights/rt_ldr_alb_nrm.tza', undefined, {
   aux: true
 }).then((unet) => {
   Promise.all([
-    loadImage('./test/test4_color.png'),
-    loadImage('./test/test4_albedo.png'),
-    loadImage('./test/test4_norm.png')
+    loadImage('./test/noisy.png'),
+    loadImage('./test/albedo.png'),
+    loadImage('./test/normal.png')
   ]).then(([colorImage, albedoImage, normImage]) => {
     const w = colorImage.width;
     const h = colorImage.height;
@@ -46,7 +46,7 @@ initUNetFromURL('../weights/rt_ldr_alb_nrm.tza', undefined, {
     const colorData = rawCtx.getImageData(0, 0, w, h);
     console.time('denoising');
 
-    abortDenoising = unet.progressiveExecute({
+    abortDenoising = unet.tileExecute({
       color: colorData,
       albedo: albedoData,
       normal: normData,

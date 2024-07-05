@@ -4,33 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Basic Demo</title>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/index.js"
+    ></script>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/styles.css"
+    />
   </head>
   <body>
-    <style>
-      #compare {
-        display: flex;
-        flex-direction: row;
-        margin-left: 10px;
-      }
-      #resize-input {
-        display: flex;
-        flex-direction: row;
-        margin-bottom: 10px;
-      }
-      #resize-input * {
-        margin-left: 10px;
-      }
-    </style>
     <body>
       <div id="resize-inputs">
-        <input value="300" type="number" id="width" />
-        <input value="300" type="number" id="height" />
+        <input value="1024" type="number" id="width" />
+        <input value="1024" type="number" id="height" />
         <button id="resize">Resize</button>
       </div>
-      <div id="compare">
-        <canvas id="raw" style="width: 50%"></canvas>
-        <canvas id="denoised" style="width: 50%"></canvas>
-      </div>
+      <img-comparison-slider style="height: 700px">
+        <canvas slot="first" style="height: 700px" id="raw"></canvas>
+        <canvas slot="second" style="height: 700px" id="denoised"></canvas>
+      </img-comparison-slider>
     </body>
     <script src="./basic.ts" type="module"></script>
   </body>
