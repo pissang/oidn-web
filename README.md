@@ -4,9 +4,9 @@ This library brings the state-of-the-art AI-based denoising library [Open Image 
 
 It's used in the [Vector to 3D](https://www.figma.com/community/plugin/1264600219316901594/) Figma plugin for high quality rendering and denoising.
 
-|                     2000 Samples                     |               3 Samples                |             3 Samples + Denoised             |
-| :--------------------------------------------------: | :------------------------------------: | :------------------------------------------: |
-| ![](./examples/test/ground-truth.png 'Ground Truth') | ![](./examples/test/noisy.png 'Noisy') | ![](./examples/test/denoised.png 'Denoised') |
+|                                           2000 Samples                                           |                                     3 Samples                                      |                                   3 Samples + Denoised                                   |
+| :----------------------------------------------------------------------------------------------: | :--------------------------------------------------------------------------------: | :--------------------------------------------------------------------------------------: |
+| ![](https://github.com/pissang/oidn-web/blob/main/examples/test/ground-truth.png 'Ground Truth') | ![](https://github.com/pissang/oidn-web/blob/main/examples/test/noisy.png 'Noisy') | ![](https://github.com/pissang/oidn-web/blob/main/examples/test/denoised.png 'Denoised') |
 
 ## How it Works.
 
@@ -101,6 +101,8 @@ initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', undefined, {
 ### Integrate into your WebGPU Pipeline
 
 If you already have a WebGPU path tracer. You can integrate the oidn-web into your pipeline. It supports input/output gpu buffers to avoid the cost of syncing between CPU and GPU.
+
+`hdr` and `aux` are required in the WebGPU pipeline.
 
 ```ts
 initUNetFromURL(
