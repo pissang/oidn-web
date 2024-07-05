@@ -77,7 +77,7 @@ initUNetFromURL('./weights/rt_hdr.tza', undefined, {
 });
 ```
 
-### Using AUX Input
+### Use auxiliary images
 
 ```ts
 import { UNet, initUNetFromURL } from 'oidn-web';
