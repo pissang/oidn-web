@@ -1,6 +1,7 @@
 # Open Image Denoise on the Web
 
 This library brings the state-of-the-art AI-based denoising library [Open Image Denoise](https://github.com/RenderKit/oidn) to the web.
+Currently it's only available on the browsers support WebGPU.
 
 It's used in the [Vector to 3D](https://www.figma.com/community/plugin/1264600219316901594/) Figma plugin for high quality rendering and denoising.
 
@@ -11,8 +12,6 @@ It's used in the [Vector to 3D](https://www.figma.com/community/plugin/126460021
 ## How it Works.
 
 It uses [tfjs](https://github.com/tensorflow/tfjs) to build the UNet model used by the OIDN. Then use the model to do prediction with a WebGPU backend from the image data.
-
-Currently it's only available on the browser with WebGPU enabled.
 
 ## How to Use
 
