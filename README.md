@@ -12,6 +12,14 @@ Currently it's only available on the browser with WebGPU enabled.
 
 ## How to Use
 
+### Install
+
+```shell
+npm i oidn-web
+```
+
+The TZA weights files are not included in the package. You can find them in this repo or [oidn-weights](https://github.com/RenderKit/oidn-weights).
+
 ### Denoise a noisy LDR image.
 
 ```ts
@@ -61,7 +69,7 @@ initUNetFromURL('./weights/rt_hdr.tza', undefined, {
 });
 ```
 
-### Using AUX
+### Using AUX Input
 
 ```ts
 import { UNet, initUNetFromURL } from 'oidn-web';
