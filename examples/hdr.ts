@@ -73,9 +73,9 @@ initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
   hdr: true
 }).then((unet) => {
   Promise.all([
-    loadHDR('./test/test4_color.hdr'),
-    loadImage('./test/test4_albedo.png'),
-    loadImage('./test/test4_norm.png')
+    loadHDR('./test/test_color.hdr'),
+    loadImage('./test/test_albedo.png'),
+    loadImage('./test/test_norm.png')
   ]).then(([colorData, albedoImage, normImage]) => {
     const w = colorData.width;
     const h = colorData.height;
@@ -94,7 +94,7 @@ initUNetFromURL('../weights/rt_hdr_calb_cnrm_large.tza', undefined, {
     rawCtx.putImageData(convertHDRDataToImageData(colorData), 0, 0);
 
     console.time('denoising');
-    abortDenoising = unet.progressiveExecute({
+    abortDenoising = unet.tileExecute({
       color: colorData,
       albedo: albedoData,
       normal: normData,

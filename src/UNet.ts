@@ -133,6 +133,29 @@ class UNet {
     this._device = this._backend.device;
   }
 
+  getDevice() {
+    return this._device;
+  }
+
+  private _buildModel(isLarge: boolean) {
+    const aux = this._aux;
+    const channels = 3 + (aux ? 6 : 0);
+    const tileSize = this._getTileSizeWithOverlap();
+
+    // TODO input process transferFunc
+    // TODO input shape
+    const input = TFInput({
+      shape: [tileSize.height, tileSize.width, channels],
+      dtype: 'float32'
+    });
+
+    this._tfModel = new LayersModel({
+      inputs: [input],
+      // TODO output process transferFunc
+      outputs: isLarge ? this._addNetLarge(input) : this._addNet(input)
+    });
+  }
+
   private _createConv(
     name: string,
     source: SymbolicTensor,
@@ -203,29 +226,6 @@ class UNet {
       size: [2, 2],
       trainable: false
     }).apply(source) as SymbolicTensor;
-  }
-
-  getDevice() {
-    return this._device;
-  }
-
-  private _buildModel(isLarge: boolean) {
-    const aux = this._aux;
-    const channels = 3 + (aux ? 6 : 0);
-    const tileSize = this._getTileSizeWithOverlap();
-
-    // TODO input process transferFunc
-    // TODO input shape
-    const input = TFInput({
-      shape: [tileSize.height, tileSize.width, channels],
-      dtype: 'float32'
-    });
-
-    this._tfModel = new LayersModel({
-      inputs: [input],
-      // TODO output process transferFunc
-      outputs: isLarge ? this._addNetLarge(input) : this._addNet(input)
-    });
   }
 
   private _addNet(input: SymbolicTensor) {
@@ -614,7 +614,7 @@ class UNet {
     }
   }
 
-  progressiveExecute<T extends ImageData | HDRImageData | GPUImageData>({
+  tileExecute<T extends ImageData | HDRImageData | GPUImageData>({
     color,
     albedo,
     normal,

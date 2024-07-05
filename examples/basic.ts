@@ -29,7 +29,7 @@ function denoise(rawImage: HTMLImageElement, unet: UNet) {
   const rawData = rawCtx.getImageData(0, 0, width, height);
   console.time('denoising');
 
-  abortDenoising = unet.progressiveExecute({
+  abortDenoising = unet.tileExecute({
     color: rawData,
     done(denoised) {
       console.timeEnd('denoising');
@@ -45,7 +45,7 @@ initUNetFromURL('../weights/rt_ldr.tza', undefined, {
   aux: false
 }).then((unet) => {
   const rawImage = new Image();
-  rawImage.src = './test/test_1spp.png';
+  rawImage.src = './test/test_color.png';
   rawImage.onload = () => {
     denoise(rawImage, unet);
   };
