@@ -16,9 +16,9 @@ Currently it's only available on the browser with WebGPU enabled.
 
 ## How to Use
 
-[Basic Example](https://oidn-web-example.vercel.app/)
+[Basic Example](https://oidn-web-example.vercel.app/) [Code](https://github.com/pissang/oidn-web-example/blob/main/src/main.js)
 
-[Example Code](https://github.com/pissang/oidn-web-example)
+[Use with three-gpu-pathtracer](https://oidn-web-example.vercel.app/three-gpu-pathtracer.html) [code](https://github.com/pissang/oidn-web-example/blob/main/src/three-gpu-pathtracer.js)
 
 ### Install
 
