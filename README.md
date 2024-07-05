@@ -20,7 +20,7 @@ npm i oidn-web
 
 The TZA weights files are not included in the package. You can find them in this repo or [oidn-weights](https://github.com/RenderKit/oidn-weights).
 
-### Denoise a noisy LDR image.
+### Denoise a noisy LDR image
 
 ```ts
 import { UNet, initUNetFromURL } from 'oidn-web';
@@ -47,12 +47,12 @@ initUNetFromURL('./weights/rt_ldr.tza').then((unet) => {
 });
 ```
 
-### Denoise a noisy HDR image.
+### Denoise a noisy HDR image
 
 ```ts
 import { UNet, initUNetFromURL } from 'oidn-web';
 initUNetFromURL('./weights/rt_hdr.tza', undefined, {
-  // Need to let the library know it's hdr input.
+  // It's hdr input.
   hdr: true
 }).then((unet) => {
   const abortDenoising = unet.tileExecute({
