@@ -15,9 +15,9 @@ It uses [tfjs](https://github.com/tensorflow/tfjs) to build the UNet model used 
 
 ## How to Use
 
-[Basic Example](https://oidn-web-example.vercel.app/) [Code](https://github.com/pissang/oidn-web-example/blob/main/src/main.js)
+[Basic Example](https://oidn-web-example.vercel.app/) ([Code](https://github.com/pissang/oidn-web-example/blob/main/src/main.js))
 
-[Use with three-gpu-pathtracer](https://oidn-web-example.vercel.app/three-gpu-pathtracer.html) [code](https://github.com/pissang/oidn-web-example/blob/main/src/three-gpu-pathtracer.js)
+[Use with three-gpu-pathtracer](https://oidn-web-example.vercel.app/three-gpu-pathtracer.html) ([Code](https://github.com/pissang/oidn-web-example/blob/main/src/three-gpu-pathtracer.js))
 
 ### Install
 
