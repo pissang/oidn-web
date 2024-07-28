@@ -140,35 +140,12 @@ const rcpNormScale = ${rcpNormScale};
 `;
 
 export class GPUDataProcess {
-  private _inputPass;
+  private _inputPassAux;
+  private _inputPassColor;
   private _outputPass;
-  constructor(private _device: GPUDevice) {
-    this._inputPass = new WGPUComputePass('inputPass', this._device, {
-      inputs: ['color', 'albedo', 'normal'],
-      outputs: ['color', 'albedo', 'normal'],
-      uniforms: [
-        {
-          label: 'inputScale',
-          type: 'f32',
-          data: new Float32Array([1])
-        },
-        {
-          label: 'inputSize',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
-        },
-        {
-          label: 'outputSize',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
-        },
-        {
-          label: 'inputOffset',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
-        }
-      ],
-      csDefine: /* wgsl */ `
+
+  constructor(private _device: GPUDevice, isHDR: boolean) {
+    const commonCSDefine = /* wgsl */ `
 ${constsCode}
 fn PUForward(y: f32) -> f32 {
   if (y <= y0) {
@@ -178,20 +155,65 @@ fn PUForward(y: f32) -> f32 {
   } else {
     return e * log(y + f) + g;
   }
-}
-`,
-      csMain: /* wgsl */ `
+}`;
+    const commonCSMain = /* wgsl */ `
 let x = f32(globalId.x);
 let y = f32(globalId.y);
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
 let col = in_color[inIdx] * inputScale;
-let alb = in_albedo[inIdx];
-let nor = in_normal[inIdx];
 
 let outIdx = i32(y * outputSize.x + x);
-out_color[outIdx] = vec3f(PUForward(col.r), PUForward(col.g), PUForward(col.b)) * normScale;
+
+if (${isHDR}) {
+  out_color[outIdx] = vec3f(PUForward(col.r), PUForward(col.g), PUForward(col.b)) * normScale;
+}
+else {
+  out_color[outIdx] = col.rgb;
+}
+`;
+    const commonUniforms = [
+      {
+        label: 'inputScale',
+        type: 'f32',
+        data: new Float32Array([1])
+      },
+      {
+        label: 'inputSize',
+        type: 'vec2<f32>',
+        data: new Float32Array(2)
+      },
+      {
+        label: 'outputSize',
+        type: 'vec2<f32>',
+        data: new Float32Array(2)
+      },
+      {
+        label: 'inputOffset',
+        type: 'vec2<f32>',
+        data: new Float32Array(2)
+      }
+    ];
+    this._inputPassAux = new WGPUComputePass('inputPassAux', this._device, {
+      inputs: ['color', 'albedo', 'normal'],
+      outputs: ['color', 'albedo', 'normal'],
+      uniforms: commonUniforms,
+      csDefine: commonCSDefine,
+      csMain: /* wgsl */ `
+${commonCSMain}
+let alb = in_albedo[inIdx];
+let nor = in_normal[inIdx];
 out_normal[outIdx] = nor.rgb;
 out_albedo[outIdx] = alb.rgb;
+`
+    });
+
+    this._inputPassColor = new WGPUComputePass('inputPassColor', this._device, {
+      inputs: ['color'],
+      outputs: ['color'],
+      uniforms: commonUniforms,
+      csDefine: commonCSDefine,
+      csMain: /* wgsl */ `
+${commonCSMain}
 `
     });
 
@@ -253,19 +275,28 @@ let inIdx = i32((y + inputOffset.y) * inputSize.x + x + inputOffset.x);
 let outIdx = i32((y + outputOffset.y) * imageSize.x + x + outputOffset.x);
 let col = in_color[inIdx] * rcpNormScale;
 let raw = in_raw[outIdx];
-out_color[outIdx] = vec4f(
-  vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale,
-  // Pick the alpha
-  raw.a
-);
+
+if (${isHDR}) {
+  out_color[outIdx] = vec4f(
+    vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale,
+    // Pick the alpha
+    raw.a
+  );
+}
+else {
+  out_color[outIdx] = vec4f(col.rgb, raw.a);
+}
 `
     });
 
     // TODO input scale
-    this._inputPass.setOutputParams({
+    this._inputPassAux.setOutputParams({
       color: { channels: 3 },
       albedo: { channels: 3 },
       normal: { channels: 3 }
+    });
+    this._inputPassColor.setOutputParams({
+      color: { channels: 3 }
     });
     // TODO input scale
     this._outputPass.setOutputParams({
@@ -274,17 +305,19 @@ out_color[outIdx] = vec4f(
   }
 
   setImageSize(w: number, h: number) {
-    this._inputPass.setUniform('inputSize', new Float32Array([w, h]));
+    this._inputPassAux.setUniform('inputSize', new Float32Array([w, h]));
+    this._inputPassColor.setUniform('inputSize', new Float32Array([w, h]));
     this._outputPass.setUniform('imageSize', new Float32Array([w, h]));
     this._outputPass.setSize(w, h);
   }
 
   setInputTile(tile: Tile) {
-    const inputPass = this._inputPass;
     const size = new Float32Array([tile.width, tile.height]);
-    inputPass.setUniform('inputOffset', new Float32Array([tile.x, tile.y]));
-    inputPass.setUniform('outputSize', size);
-    inputPass.setSize(size[0], size[1]);
+    [this._inputPassAux, this._inputPassColor].forEach((inputPass) => {
+      inputPass.setUniform('inputOffset', new Float32Array([tile.x, tile.y]));
+      inputPass.setUniform('outputSize', size);
+      inputPass.setSize(size[0], size[1]);
+    });
 
     this._outputPass.setUniform('inputSize', size);
   }
@@ -306,23 +339,34 @@ out_color[outIdx] = vec4f(
   forward(
     colorBuffer: GPUBuffer,
     // TODO optional albedo and normal.
-    albedoBuffer: GPUBuffer,
-    normalBuffer: GPUBuffer
+    albedoBuffer?: GPUBuffer,
+    normalBuffer?: GPUBuffer
   ) {
-    const inputGPUPass = this._inputPass;
+    const inputPassAux = this._inputPassAux;
+    const inputPassColor = this._inputPassColor;
     const commandEncoder = this._device.createCommandEncoder();
-    inputGPUPass.createPass(commandEncoder, {
-      color: { buffer: colorBuffer, channels: 4 },
-      albedo: { buffer: albedoBuffer, channels: 4 },
-      normal: { buffer: normalBuffer, channels: 4 }
-    });
+    if (albedoBuffer && normalBuffer) {
+      inputPassAux.createPass(commandEncoder, {
+        color: { buffer: colorBuffer, channels: 4 },
+        albedo: { buffer: albedoBuffer, channels: 4 },
+        normal: { buffer: normalBuffer, channels: 4 }
+      });
+    } else {
+      inputPassColor.createPass(commandEncoder, {
+        color: { buffer: colorBuffer, channels: 4 }
+      });
+    }
     this._device.queue.submit([commandEncoder.finish()]);
 
-    return {
-      color: inputGPUPass.getOutputBuffer('color'),
-      albedo: inputGPUPass.getOutputBuffer('albedo'),
-      normal: inputGPUPass.getOutputBuffer('normal')
-    };
+    return albedoBuffer && normalBuffer
+      ? {
+          color: inputPassAux.getOutputBuffer('color'),
+          albedo: inputPassAux.getOutputBuffer('albedo'),
+          normal: inputPassAux.getOutputBuffer('normal')
+        }
+      : {
+          color: inputPassColor.getOutputBuffer('color')
+        };
   }
 
   inverse(buffer: GPUBuffer, raw: GPUBuffer) {
@@ -357,6 +401,6 @@ out_color[outIdx] = vec4f(
 
   dispose() {
     this._outputPass.dispose();
-    this._inputPass.dispose();
+    this._inputPassAux.dispose();
   }
 }

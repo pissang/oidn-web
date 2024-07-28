@@ -450,8 +450,8 @@ class UNet {
       | {
           color: GPUBuffer;
           // TODO optional
-          albedo: GPUBuffer;
-          normal: GPUBuffer;
+          albedo?: GPUBuffer;
+          normal?: GPUBuffer;
         },
     outputTileData: ImageData | HDRImageData | undefined,
     outputImageData: ImageData | HDRImageData | undefined,
@@ -491,11 +491,11 @@ class UNet {
       if (isHDR) {
         inputScale = avgLogLum({
           data: tileData,
-          channels: 9
+          channels
         });
         tileData = hdrTransferFuncCPU({
           data: tileData,
-          channels: 9,
+          channels,
           inputScale
         });
       }
@@ -505,11 +505,11 @@ class UNet {
         'float32'
       ) as Tensor4D;
     } else {
-      if (!isHDR) {
-        throw new Error('Only hdr is supported for webgpu data.');
-      }
       if (!dataProcessGPU) {
-        dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(device);
+        dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(
+          device,
+          isHDR
+        );
       }
       dataProcessGPU.setImageSize(width, height);
       dataProcessGPU.setInputTile(srcTile);
@@ -519,12 +519,17 @@ class UNet {
       }
       const { color, albedo, normal } = dataProcessGPU.forward(
         inputData.color,
-        inputData.albedo,
-        inputData.normal
+        this._aux ? inputData.albedo : undefined,
+        this._aux ? inputData.normal : undefined
       );
-      const shape = [1, srcTileHeight, srcTileWidth, 4] as any;
-      const auxTensors = [color, albedo, normal].map((buffer) => {
-        const tmp = tensor({ buffer, zeroCopy: true }, shape) as Tensor4D;
+
+      const createTensor = (buffer: GPUBuffer) => {
+        const tmp = tensor({ buffer, zeroCopy: true }, [
+          1,
+          srcTileHeight,
+          srcTileWidth,
+          4
+        ]) as Tensor4D;
         const ret = slice4d(
           tmp,
           [0, 0, 0, 0],
@@ -532,11 +537,18 @@ class UNet {
         );
         tmp.dispose();
         return ret;
-      });
+      };
 
-      tileTensor = concat4d(auxTensors, 3);
-      // TODO reuse tensors?
-      auxTensors.forEach((t) => t.dispose());
+      if (this._aux) {
+        const tensors = [color, albedo, normal].map((buffer) =>
+          createTensor(buffer!)
+        );
+        tileTensor = concat4d(tensors, 3);
+        // TODO reuse tensors?
+        tensors.forEach((t) => t.dispose());
+      } else {
+        tileTensor = createTensor(color);
+      }
     }
     // We need resize if input size is smaller than tile size. And is rounded up.
     if (needsResize) {
@@ -655,8 +667,8 @@ class UNet {
     if (!isGPUImageData(color)) {
       rawData = this._processImageData(
         color,
-        albedo as ImageData,
-        normal as ImageData,
+        albedo as ImageData | undefined,
+        normal as ImageData | undefined,
         hdr
       );
     }
@@ -694,8 +706,8 @@ class UNet {
         isGPUImageData(color)
           ? {
               color: color.data,
-              albedo: (albedo as GPUImageData).data,
-              normal: (normal as GPUImageData).data
+              albedo: (albedo as GPUImageData | undefined)?.data,
+              normal: (normal as GPUImageData | undefined)?.data
             }
           : rawData,
         outputTileData,

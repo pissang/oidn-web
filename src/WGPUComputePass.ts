@@ -36,6 +36,7 @@ export class WGPUComputePass<I extends string, O extends string> {
   private _pipeline!: GPUComputePipeline;
   private _bindGroups: GPUBindGroup[] = [];
   private _needsUpdatePipeline = true;
+  private _needsResizeBuffer = true;
 
   private _inputs: string[] = [];
   private _outputs: string[] = [];
@@ -92,7 +93,7 @@ export class WGPUComputePass<I extends string, O extends string> {
     this._width = width;
     this._height = height;
     if (sizeChanged) {
-      this._resizeOutputBuffers();
+      this._needsResizeBuffer = true;
       this._needsUpdatePipeline = true;
     }
   }
@@ -268,6 +269,10 @@ ${this._csMain}
     commandEncoder: GPUCommandEncoder,
     inputBuffers: Record<I, WGPUComputePassInput>
   ) {
+    if (this._needsResizeBuffer) {
+      this._resizeOutputBuffers();
+      this._needsResizeBuffer = false;
+    }
     this._updatePipeline(inputBuffers);
 
     const hasInputs = this._inputs.length > 0;
