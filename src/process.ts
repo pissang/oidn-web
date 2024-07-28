@@ -160,17 +160,18 @@ fn PUForward(y: f32) -> f32 {
 let x = f32(globalId.x);
 let y = f32(globalId.y);
 let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
-let col = in_color[inIdx] * inputScale;
+let col = in_color[inIdx];
 
 let outIdx = i32(y * outputSize.x + x);
 
 if (${isHDR}) {
-  out_color[outIdx] = vec3f(PUForward(col.r), PUForward(col.g), PUForward(col.b)) * normScale;
+  out_color[outIdx] = vec3f(PUForward(col.r * inputScale), PUForward(col.g * inputScale), PUForward(col.b * inputScale)) * normScale;
 }
 else {
   out_color[outIdx] = col.rgb;
 }
 `;
+
     const commonUniforms = [
       {
         label: 'inputScale',
@@ -273,12 +274,12 @@ if (x >= outputSize.x || y >= outputSize.y) {
 }
 let inIdx = i32((y + inputOffset.y) * inputSize.x + x + inputOffset.x);
 let outIdx = i32((y + outputOffset.y) * imageSize.x + x + outputOffset.x);
-let col = in_color[inIdx] * rcpNormScale;
+let col = in_color[inIdx];
 let raw = in_raw[outIdx];
 
 if (${isHDR}) {
   out_color[outIdx] = vec4f(
-    vec3f(PUInverse(col.r), PUInverse(col.g), PUInverse(col.b)) / inputScale,
+    vec3f(PUInverse(col.r * rcpNormScale), PUInverse(col.g * rcpNormScale), PUInverse(col.b * rcpNormScale)) / inputScale,
     // Pick the alpha
     raw.a
   );
