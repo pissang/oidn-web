@@ -23,6 +23,8 @@ export interface WGPUComputePassOutput {
 }
 
 export class WGPUComputePass<I extends string, O extends string> {
+  private autoUpdateOutputBuffer = true;
+
   private _label;
 
   private _device;
@@ -119,8 +121,20 @@ export class WGPUComputePass<I extends string, O extends string> {
   }
 
   setOutputParams(outputParams: Record<O, WGPUComputePassOutput>) {
-    this._updateOutputBuffers(outputParams);
+    if (this.autoUpdateOutputBuffer) {
+      this._updateOutputBuffers(outputParams);
+    }
     this._needsUpdatePipeline = true;
+  }
+
+  setOutputBuffers(outputBuffers: Record<O, GPUBuffer>) {
+    this._outputBuffers = Object.keys(outputBuffers).reduce((obj, key) => {
+      obj[key] = {
+        buffer: outputBuffers[key as O],
+        params: { channels: 4 }
+      };
+      return obj;
+    }, {} as WGPUComputePass<I, O>['_outputBuffers']);
   }
 
   setUniform(label: string, data: Float32Array | Int32Array | Uint32Array) {
@@ -298,7 +312,7 @@ ${this._csMain}
     commandEncoder: GPUCommandEncoder,
     inputs: Record<I, WGPUComputePassInput>
   ) {
-    if (this._needsResizeBuffer) {
+    if (this._needsResizeBuffer && this.autoUpdateOutputBuffer) {
       this._resizeOutputBuffers();
       this._needsResizeBuffer = false;
     }

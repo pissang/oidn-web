@@ -1,4 +1,4 @@
-import { buffer } from '@tensorflow/tfjs';
+import { buffer, data } from '@tensorflow/tfjs';
 import { WGPUComputePass } from './WGPUComputePass';
 
 const a = 1.41283765e3;
@@ -144,8 +144,12 @@ export class GPUDataProcess {
   private _inputPassAux;
   private _inputPassColor;
   private _outputPass;
+  private _copyPass;
 
   private _isInputTexture = false;
+
+  private _width = 0;
+  private _height = 0;
 
   constructor(
     private _device: GPUDevice,
@@ -226,7 +230,21 @@ export class GPUDataProcess {
       csDefine: '',
       csMain: ``
     });
-    // TODO input scale
+    this._copyPass = new WGPUComputePass('copyPass', this._device, {
+      inputs: ['color'],
+      outputs: ['color'],
+      uniforms: [
+        {
+          label: 'size',
+          type: 'vec2<f32>',
+          data: new Float32Array(2)
+        }
+      ],
+      csMain: /*wgsl*/ `
+let outIdx = i32(globalId.x + globalId.y * u32(size.x));
+out_color[outIdx] = textureLoad(in_color, globalId.xy, 0);
+`
+    });
     this._inputPassAux.setOutputParams({
       color: { channels: 3 },
       albedo: { channels: 3 },
@@ -235,7 +253,6 @@ export class GPUDataProcess {
     this._inputPassColor.setOutputParams({
       color: { channels: 3 }
     });
-    // TODO input scale
     this._outputPass.setOutputParams({
       color: { channels: 4 }
     });
@@ -350,6 +367,9 @@ else {
     this._inputPassColor.setUniform('inputSize', new Float32Array([w, h]));
     this._outputPass.setUniform('imageSize', new Float32Array([w, h]));
     this._outputPass.setSize(w, h);
+
+    this._width = w;
+    this._height = h;
   }
 
   setInputTile(tile: Tile) {
@@ -444,20 +464,30 @@ else {
   }
 
   copyInputDataToOutput(inputColorBuffer: GPUBuffer | GPUTexture) {
-    if (inputColorBuffer instanceof GPUTexture) {
-      // TODO
-      return;
-    }
     const encoder = this._device.createCommandEncoder();
     const outputGPUPass = this._outputPass;
     const colorBuffer = outputGPUPass.getOutput('color');
-    encoder.copyBufferToBuffer(
-      inputColorBuffer,
-      0,
-      colorBuffer,
-      0,
-      colorBuffer.size
-    );
+    const copyPass = this._copyPass;
+
+    if (inputColorBuffer instanceof GPUTexture) {
+      const size = new Float32Array([this._width, this._height]);
+      copyPass.setUniform('size', size);
+      copyPass.setSize(size[0], size[1]);
+      copyPass.setOutputBuffers({
+        color: colorBuffer
+      });
+      copyPass.createPass(encoder, {
+        color: { texture: inputColorBuffer, channels: 4 }
+      });
+    } else {
+      encoder.copyBufferToBuffer(
+        inputColorBuffer,
+        0,
+        colorBuffer,
+        0,
+        colorBuffer.size
+      );
+    }
 
     this._device.queue.submit([encoder.finish()]);
   }
