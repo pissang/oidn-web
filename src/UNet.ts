@@ -744,9 +744,9 @@ class UNet {
         height
       };
       progress?.(
-        output as T,
+        output as any,
         // Is undefined if using webgpu buffer
-        outputTileData as T | undefined,
+        outputTileData as any,
         new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
         i + j * tileCountW,
         tileCountW * tileCountH
@@ -761,7 +761,7 @@ class UNet {
           }
         });
       } else {
-        done(output as T);
+        done(output as any);
       }
     };
 
