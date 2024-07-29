@@ -68,6 +68,12 @@ interface HDRImageData {
 }
 
 interface GPUImageData {
+  data: GPUBuffer | GPUTexture;
+  width: number;
+  height: number;
+}
+
+interface GPUImageDataOutput {
   data: GPUBuffer;
   width: number;
   height: number;
@@ -84,7 +90,7 @@ function roundUp2(a: number, b: number, c: number) {
 function isGPUImageData(
   data: ImageData | GPUImageData | HDRImageData
 ): data is GPUImageData {
-  return data.data instanceof GPUBuffer;
+  return data.data instanceof GPUBuffer || data.data instanceof GPUTexture;
 }
 
 const receptiveField = 174; // receptive field in pixels
@@ -109,8 +115,9 @@ class UNet {
   private _tileOverlapX = 0;
   private _tileOverlapY = 0;
 
-  private _aux = false;
-  private _hdr = false;
+  private _aux;
+  private _hdr;
+  private _denoiseAlpha;
 
   private _dataProcessGPU?: GPUDataProcess;
 
@@ -120,13 +127,24 @@ class UNet {
     private _tensors: Map<string, HostTensor>,
     private _backend: WebGPUBackend,
     opts: {
+      /**
+       * If use auxiliary data.
+       */
       aux?: boolean;
+      /**
+       * If input is HDR image.
+       */
       hdr?: boolean;
+      /**
+       * If denoise alpha channel. Otherwise denoise RGB channels.
+       */
+      denoiseAlpha?: boolean;
       maxTileSize?: number;
     } = {}
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
+    this._denoiseAlpha = opts.denoiseAlpha || false;
 
     this._maxTileSize = opts.maxTileSize ?? 512;
 
@@ -448,10 +466,10 @@ class UNet {
     inputData:
       | Float32Array
       | {
-          color: GPUBuffer;
+          color: GPUBuffer | GPUTexture;
           // TODO optional
-          albedo?: GPUBuffer;
-          normal?: GPUBuffer;
+          albedo?: GPUBuffer | GPUTexture;
+          normal?: GPUBuffer | GPUTexture;
         },
     outputTileData: ImageData | HDRImageData | undefined,
     outputImageData: ImageData | HDRImageData | undefined,
@@ -508,7 +526,8 @@ class UNet {
       if (!dataProcessGPU) {
         dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(
           device,
-          isHDR
+          isHDR,
+          this._denoiseAlpha
         );
       }
       dataProcessGPU.setImageSize(width, height);
@@ -636,10 +655,10 @@ class UNet {
     color: T;
     albedo?: ImageData | GPUImageData;
     normal?: ImageData | GPUImageData;
-    done: (outputData: T) => void;
+    done: (outputData: T extends GPUImageData ? GPUImageDataOutput : T) => void;
     progress?: (
-      outputData: T,
-      tileData: T | undefined,
+      outputData: T extends GPUImageData ? GPUImageDataOutput : T,
+      tileData: (T extends GPUImageData ? GPUImageDataOutput : T) | undefined,
       tile: Tile,
       currentIdx: number,
       totalIdx: number

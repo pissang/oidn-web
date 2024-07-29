@@ -13,7 +13,8 @@ export interface Uniform {
   data: Float32Array | Int32Array | Uint32Array;
 }
 export interface WGPUComputePassInput {
-  buffer: GPUBuffer;
+  buffer?: GPUBuffer;
+  texture?: GPUTexture;
   channels: number;
 }
 
@@ -53,6 +54,12 @@ export class WGPUComputePass<I extends string, O extends string> {
   private _csMain;
   private _csDefine;
 
+  private _groupOffsets = {
+    inputs: 0,
+    uniforms: 1,
+    outputs: 2
+  };
+
   constructor(
     label: string,
     device: GPUDevice,
@@ -86,6 +93,12 @@ export class WGPUComputePass<I extends string, O extends string> {
     });
   }
 
+  setCSCode({ csDefine, csMain }: { csDefine: string; csMain: string }) {
+    this._csDefine = csDefine;
+    this._csMain = csMain;
+    this._needsUpdatePipeline = true;
+  }
+
   setSize(width: number, height: number) {
     width = Math.ceil(width);
     height = Math.ceil(height);
@@ -115,7 +128,7 @@ export class WGPUComputePass<I extends string, O extends string> {
     this._device.queue.writeBuffer(buffer, 0, data);
   }
 
-  getOutputBuffer(name: O) {
+  getOutput(name: O) {
     return this._outputBuffers[name].buffer;
   }
 
@@ -124,7 +137,7 @@ export class WGPUComputePass<I extends string, O extends string> {
       (this._uniformBuffers as any)[key].destroy();
     });
     Object.keys(this._outputBuffers).forEach((key) => {
-      (this._outputBuffers as any)[key].texture.destroy();
+      (this._outputBuffers as any)[key].buffer.destroy();
     });
   }
 
@@ -174,13 +187,16 @@ export class WGPUComputePass<I extends string, O extends string> {
     }
   }
 
-  private _updatePipeline(inputParams: Record<string, WGPUComputePassInput>) {
+  private _updatePipeline(
+    inputParams: Record<string, WGPUComputePassInput>,
+    inputTypes: Record<string, 'texture' | 'buffer'>
+  ) {
     if (!this._needsUpdatePipeline) {
       return;
     }
     this._needsUpdatePipeline = false;
     const device = this._device;
-    const csCode = this._getFullCs(inputParams);
+    const csCode = this._getFullCs(inputParams, inputTypes);
     if (csCode === this._csCode) {
       return;
     }
@@ -199,35 +215,49 @@ export class WGPUComputePass<I extends string, O extends string> {
     this._updateBindGroups();
   }
 
-  private _getFullCs(inputParams: Record<string, WGPUComputePassInput>) {
+  private _getFullCs(
+    inputParams: Record<string, WGPUComputePassInput>,
+    inputTypes: Record<string, 'texture' | 'buffer'>
+  ) {
     const inputs = this._inputs;
-    const hasInputs = inputs.length > 0;
+    const uniforms = this._uniforms;
+    let offset = 0;
+    const groupOffsets = (this._groupOffsets = {
+      inputs: 0,
+      uniforms: 0,
+      outputs: 0
+    });
+    if (inputs.length > 0) {
+      offset++;
+    }
+    if (uniforms.length > 0) {
+      groupOffsets.uniforms = offset;
+      offset++;
+    }
+    groupOffsets.outputs = offset;
     const cs = `
 ${inputs
   .sort()
-  .map(
-    (bufferName, idx) =>
-      // TODO more channels option.
-      `@group(0) @binding(${idx}) var<storage, read> in_${bufferName}: array<vec${inputParams[bufferName].channels}f>;`
-  )
+  .map((inputName, idx) => {
+    const bindingPrefix = `@group(${groupOffsets.inputs}) @binding(${idx}) `;
+    const varName = `in_${inputName}`;
+    // TODO more channels option.
+    return inputTypes[inputName] === 'texture'
+      ? `${bindingPrefix} var ${varName}: texture_2d<f32>;`
+      : `${bindingPrefix} var<storage, read> ${varName}: array<vec${inputParams[inputName].channels}f>;`;
+  })
   .join('\n')}
 ${this._uniforms
   .map(
     (uniform, idx) =>
-      `@group(${hasInputs ? 1 : 0}) @binding(${idx}) var<uniform> ${
-        uniform.label
-      }: ${uniform.type};`
+      `@group(${groupOffsets.uniforms}) @binding(${idx}) var<uniform> ${uniform.label}: ${uniform.type};`
   )
   .join('\n')}
 
 ${this._outputs
   .map(
     (name, idx) =>
-      `@group(${
-        hasInputs ? 2 : 1
-      }) @binding(${idx}) var<storage, read_write> out_${name}: array<vec${
-        this._outputBuffers[name].params.channels
-      }f>;`
+      `@group(${groupOffsets.outputs}) @binding(${idx}) var<storage, read_write> out_${name}: array<vec${this._outputBuffers[name].params.channels}f>;`
   )
   .join('\n')}
 ${this._csDefine ?? ''}
@@ -243,13 +273,12 @@ ${this._csMain}
   private _updateBindGroups() {
     const bindGroups: GPUBindGroup[] = [];
     const device = this._device;
+    const groupOffsets = this._groupOffsets;
 
-    //TODO
-    const uniformBindGroupIndex = this._inputs.length > 0 ? 1 : 0;
     if (this._uniforms.length > 0) {
-      bindGroups[uniformBindGroupIndex] = device.createBindGroup({
+      bindGroups[groupOffsets.uniforms] = device.createBindGroup({
         label: this._label,
-        layout: this._pipeline.getBindGroupLayout(uniformBindGroupIndex),
+        layout: this._pipeline.getBindGroupLayout(groupOffsets.uniforms),
         entries: this._uniforms.map(
           (uniform, idx) =>
             ({
@@ -267,34 +296,42 @@ ${this._csMain}
 
   createPass(
     commandEncoder: GPUCommandEncoder,
-    inputBuffers: Record<I, WGPUComputePassInput>
+    inputs: Record<I, WGPUComputePassInput>
   ) {
     if (this._needsResizeBuffer) {
       this._resizeOutputBuffers();
       this._needsResizeBuffer = false;
     }
-    this._updatePipeline(inputBuffers);
 
-    const hasInputs = this._inputs.length > 0;
+    const inputTypes = this._inputs.reduce((obj, inputName) => {
+      obj[inputName] = inputs[inputName as I].buffer ? 'buffer' : 'texture';
+      return obj;
+    }, {} as Record<string, 'texture' | 'buffer'>);
+
+    this._updatePipeline(inputs, inputTypes);
+
+    const groupOffsets = this._groupOffsets;
     // TODO createBindGroup every time?
-    if (hasInputs) {
-      this._bindGroups[0] = this._device.createBindGroup({
+    if (this._inputs.length > 0) {
+      this._bindGroups[groupOffsets.inputs] = this._device.createBindGroup({
         label: this._label,
-        layout: this._pipeline.getBindGroupLayout(0),
-        entries: this._inputs.map((bufferName, idx) => ({
+        layout: this._pipeline.getBindGroupLayout(groupOffsets.inputs),
+        entries: this._inputs.map((inputName, idx) => ({
           binding: idx,
           // TODO
-          resource: {
-            buffer: inputBuffers[bufferName as I].buffer
-          }
+          resource: inputs[inputName as I].buffer
+            ? {
+                buffer: inputs[inputName as I].buffer!
+              }
+            : inputs[inputName as I].texture!.createView()
         }))
       });
     }
 
     // Outputs
-    this._bindGroups[hasInputs ? 2 : 1] = this._device.createBindGroup({
+    this._bindGroups[groupOffsets.outputs] = this._device.createBindGroup({
       label: this._label,
-      layout: this._pipeline.getBindGroupLayout(hasInputs ? 2 : 1),
+      layout: this._pipeline.getBindGroupLayout(groupOffsets.outputs),
       entries: this._outputs.map((bufferName, idx) => ({
         binding: idx,
         resource: {

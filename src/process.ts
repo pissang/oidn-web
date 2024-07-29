@@ -1,3 +1,4 @@
+import { buffer } from '@tensorflow/tfjs';
 import { WGPUComputePass } from './WGPUComputePass';
 
 const a = 1.41283765e3;
@@ -144,34 +145,13 @@ export class GPUDataProcess {
   private _inputPassColor;
   private _outputPass;
 
-  constructor(private _device: GPUDevice, isHDR: boolean) {
-    const commonCSDefine = /* wgsl */ `
-${constsCode}
-fn PUForward(y: f32) -> f32 {
-  if (y <= y0) {
-    return a * y;
-  } else if (y <= y1) {
-    return b * pow(y, c) + d;
-  } else {
-    return e * log(y + f) + g;
-  }
-}`;
-    const commonCSMain = /* wgsl */ `
-let x = f32(globalId.x);
-let y = f32(globalId.y);
-let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
-let col = in_color[inIdx];
+  private _isInputTexture = false;
 
-let outIdx = i32(y * outputSize.x + x);
-
-if (${isHDR}) {
-  out_color[outIdx] = vec3f(PUForward(col.r * inputScale), PUForward(col.g * inputScale), PUForward(col.b * inputScale)) * normScale;
-}
-else {
-  out_color[outIdx] = col.rgb;
-}
-`;
-
+  constructor(
+    private _device: GPUDevice,
+    private _isHDR: boolean,
+    private _denoiseAlpha: boolean
+  ) {
     const commonUniforms = [
       {
         label: 'inputScale',
@@ -198,32 +178,21 @@ else {
       inputs: ['color', 'albedo', 'normal'],
       outputs: ['color', 'albedo', 'normal'],
       uniforms: commonUniforms,
-      csDefine: commonCSDefine,
-      csMain: /* wgsl */ `
-${commonCSMain}
-let alb = in_albedo[inIdx];
-let nor = in_normal[inIdx];
-out_normal[outIdx] = nor.rgb;
-out_albedo[outIdx] = alb.rgb;
-`
+      csDefine: '',
+      csMain: ``
     });
-
     this._inputPassColor = new WGPUComputePass('inputPassColor', this._device, {
       inputs: ['color'],
       outputs: ['color'],
       uniforms: commonUniforms,
-      csDefine: commonCSDefine,
-      csMain: /* wgsl */ `
-${commonCSMain}
-`
+      csDefine: '',
+      csMain: ``
     });
-
     this._outputPass = new WGPUComputePass('outputPass', this._device, {
       inputs: ['color', 'raw'],
       outputs: ['color'],
       uniforms: [
         {
-          // TODO inputScale from avg log lum
           label: 'inputScale',
           type: 'f32',
           data: new Float32Array([1])
@@ -254,6 +223,84 @@ ${commonCSMain}
           data: new Float32Array(2)
         }
       ],
+      csDefine: '',
+      csMain: ``
+    });
+    // TODO input scale
+    this._inputPassAux.setOutputParams({
+      color: { channels: 3 },
+      albedo: { channels: 3 },
+      normal: { channels: 3 }
+    });
+    this._inputPassColor.setOutputParams({
+      color: { channels: 3 }
+    });
+    // TODO input scale
+    this._outputPass.setOutputParams({
+      color: { channels: 4 }
+    });
+  }
+
+  private _updatePasses(isInputTexture: boolean) {
+    if (this._isInputTexture === isInputTexture) {
+      return;
+    }
+
+    this._isInputTexture = isInputTexture;
+    const isHDR = this._isHDR;
+    const denoiseAlpha = this._denoiseAlpha;
+    const commonCSDefine = /* wgsl */ `
+${constsCode}
+fn PUForward(y: f32) -> f32 {
+  if (y <= y0) {
+    return a * y;
+  } else if (y <= y1) {
+    return b * pow(y, c) + d;
+  } else {
+    return e * log(y + f) + g;
+  }
+}`;
+    function readInputCode(inputName: string) {
+      return isInputTexture
+        ? `textureLoad(in_${inputName}, globalId.xy + vec2u(inputOffset), 0)`
+        : `in_${inputName}[inIdx]'`;
+    }
+    const commonCSMain = /* wgsl */ `
+let x = f32(globalId.x);
+let y = f32(globalId.y);
+let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
+let col = ${readInputCode('color')};
+
+let outIdx = i32(y * outputSize.x + x);
+
+if (${denoiseAlpha}) {
+  out_color[outIdx] = vec3f(col.a);
+}
+else if (${isHDR}) {
+  out_color[outIdx] = vec3f(PUForward(col.r * inputScale), PUForward(col.g * inputScale), PUForward(col.b * inputScale)) * normScale;
+}
+else {
+  out_color[outIdx] = col.rgb;
+}
+`;
+    this._inputPassAux.setCSCode({
+      csDefine: commonCSDefine,
+      csMain: /* wgsl */ `
+${commonCSMain}
+let alb = ${readInputCode('albedo')};
+let nor = ${readInputCode('normal')};
+out_normal[outIdx] = nor.rgb;
+out_albedo[outIdx] = alb.rgb;
+  `
+    });
+
+    this._inputPassColor.setCSCode({
+      csDefine: commonCSDefine,
+      csMain: /* wgsl */ `
+${commonCSMain}
+`
+    });
+    this._outputPass.setCSCode({
       csDefine: /* wgsl */ `
 ${constsCode}
 fn PUInverse(y: f32) -> f32 {
@@ -275,9 +322,16 @@ if (x >= outputSize.x || y >= outputSize.y) {
 let inIdx = i32((y + inputOffset.y) * inputSize.x + x + inputOffset.x);
 let outIdx = i32((y + outputOffset.y) * imageSize.x + x + outputOffset.x);
 let col = in_color[inIdx];
-let raw = in_raw[outIdx];
+let raw = ${
+        isInputTexture
+          ? 'textureLoad(in_raw, globalId.xy + vec2u(outputOffset), 0)'
+          : 'in_raw[outIdx]'
+      };
 
-if (${isHDR}) {
+if (${denoiseAlpha}) {
+  out_color[outIdx] = vec4f(raw.rgb, col.r);
+}
+else if (${isHDR}) {
   out_color[outIdx] = vec4f(
     vec3f(PUInverse(col.r * rcpNormScale), PUInverse(col.g * rcpNormScale), PUInverse(col.b * rcpNormScale)) / inputScale,
     // Pick the alpha
@@ -288,20 +342,6 @@ else {
   out_color[outIdx] = vec4f(col.rgb, raw.a);
 }
 `
-    });
-
-    // TODO input scale
-    this._inputPassAux.setOutputParams({
-      color: { channels: 3 },
-      albedo: { channels: 3 },
-      normal: { channels: 3 }
-    });
-    this._inputPassColor.setOutputParams({
-      color: { channels: 3 }
-    });
-    // TODO input scale
-    this._outputPass.setOutputParams({
-      color: { channels: 4 }
     });
   }
 
@@ -338,39 +378,54 @@ else {
   }
 
   forward(
-    colorBuffer: GPUBuffer,
+    colorBuffer: GPUBuffer | GPUTexture,
     // TODO optional albedo and normal.
-    albedoBuffer?: GPUBuffer,
-    normalBuffer?: GPUBuffer
+    albedoBuffer: GPUBuffer | GPUTexture | undefined,
+    normalBuffer: GPUBuffer | GPUTexture | undefined
   ) {
+    const isInputTexture = colorBuffer instanceof GPUTexture;
+    this._updatePasses(isInputTexture);
+
     const inputPassAux = this._inputPassAux;
     const inputPassColor = this._inputPassColor;
     const commandEncoder = this._device.createCommandEncoder();
+
+    function createInput(bufferOrTex: GPUBuffer | GPUTexture) {
+      return bufferOrTex instanceof GPUTexture
+        ? {
+            texture: bufferOrTex,
+            channels: 4
+          }
+        : {
+            buffer: bufferOrTex,
+            channels: 4
+          };
+    }
     if (albedoBuffer && normalBuffer) {
       inputPassAux.createPass(commandEncoder, {
-        color: { buffer: colorBuffer, channels: 4 },
-        albedo: { buffer: albedoBuffer, channels: 4 },
-        normal: { buffer: normalBuffer, channels: 4 }
+        color: createInput(colorBuffer),
+        albedo: createInput(albedoBuffer),
+        normal: createInput(normalBuffer)
       });
     } else {
       inputPassColor.createPass(commandEncoder, {
-        color: { buffer: colorBuffer, channels: 4 }
+        color: createInput(colorBuffer)
       });
     }
     this._device.queue.submit([commandEncoder.finish()]);
 
     return albedoBuffer && normalBuffer
       ? {
-          color: inputPassAux.getOutputBuffer('color'),
-          albedo: inputPassAux.getOutputBuffer('albedo'),
-          normal: inputPassAux.getOutputBuffer('normal')
+          color: inputPassAux.getOutput('color'),
+          albedo: inputPassAux.getOutput('albedo'),
+          normal: inputPassAux.getOutput('normal')
         }
       : {
-          color: inputPassColor.getOutputBuffer('color')
+          color: inputPassColor.getOutput('color')
         };
   }
 
-  inverse(buffer: GPUBuffer, raw: GPUBuffer) {
+  inverse(buffer: GPUBuffer, raw: GPUBuffer | GPUTexture) {
     const device = this._device;
 
     const commandEncoder = device.createCommandEncoder();
@@ -378,17 +433,24 @@ else {
 
     outputGPUPass.createPass(commandEncoder, {
       color: { buffer: buffer, channels: 4 },
-      raw: { buffer: raw, channels: 4 }
+      raw:
+        raw instanceof GPUBuffer
+          ? { buffer: raw, channels: 4 }
+          : { texture: raw, channels: 4 }
     });
     this._device.queue.submit([commandEncoder.finish()]);
 
-    return outputGPUPass.getOutputBuffer('color');
+    return outputGPUPass.getOutput('color');
   }
 
-  copyInputDataToOutput(inputColorBuffer: GPUBuffer) {
+  copyInputDataToOutput(inputColorBuffer: GPUBuffer | GPUTexture) {
+    if (inputColorBuffer instanceof GPUTexture) {
+      // TODO
+      return;
+    }
     const encoder = this._device.createCommandEncoder();
     const outputGPUPass = this._outputPass;
-    const colorBuffer = outputGPUPass.getOutputBuffer('color');
+    const colorBuffer = outputGPUPass.getOutput('color');
     encoder.copyBufferToBuffer(
       inputColorBuffer,
       0,
