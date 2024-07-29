@@ -7,6 +7,7 @@ import { mirrorPad } from '@tensorflow/tfjs-core/dist/ops/mirror_pad';
 import { pad4d } from '@tensorflow/tfjs-core/dist/ops/pad4d';
 import { slice4d } from '@tensorflow/tfjs-core/dist/ops/slice4d';
 import { concat4d } from '@tensorflow/tfjs-core/dist/ops/concat_4d';
+import { ENGINE } from '@tensorflow/tfjs-core/dist/engine';
 import {
   Conv2D,
   UpSampling2D
@@ -14,7 +15,6 @@ import {
 import { MaxPooling2D } from '@tensorflow/tfjs-layers/dist/layers/pooling';
 import { Concatenate } from '@tensorflow/tfjs-layers/dist/layers/merge';
 import { LayersModel } from '@tensorflow/tfjs-layers/dist/engine/training';
-import type { Layer } from '@tensorflow/tfjs-layers/dist/engine/topology';
 import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_layer';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
@@ -26,7 +26,8 @@ import {
   hdrTransferFuncInverseCPU
 } from './process';
 import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
-// import { profileAndLogKernelCode } from './helper';
+
+// import { profileAndLogKernelCode, memory } from './helper';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -352,24 +353,24 @@ class UNet {
       tileOverlapY = 0;
     }
 
-    if (
-      tileWidth !== this._tileWidth ||
-      tileHeight !== this._tileHeight ||
-      tileOverlapX !== this._tileOverlapX ||
-      tileOverlapY !== this._tileOverlapY ||
-      !this._tfModel
-    ) {
-      this._tileWidth = tileWidth;
-      this._tileHeight = tileHeight;
-      this._tileOverlapX = tileOverlapX;
-      this._tileOverlapY = tileOverlapY;
+    // if (
+    //   tileWidth !== this._tileWidth ||
+    //   tileHeight !== this._tileHeight ||
+    //   tileOverlapX !== this._tileOverlapX ||
+    //   tileOverlapY !== this._tileOverlapY ||
+    //   !this._tfModel
+    // ) {
+    this._tileWidth = tileWidth;
+    this._tileHeight = tileHeight;
+    this._tileOverlapX = tileOverlapX;
+    this._tileOverlapY = tileOverlapY;
 
-      if (this._tfModel) {
-        this._tfModel.dispose();
-      }
-
-      this._buildModel(isLarge);
+    if (this._tfModel) {
+      this._tfModel.dispose();
     }
+
+    this._buildModel(isLarge);
+    // }
   }
 
   private _getTileSizeWithOverlap() {
@@ -603,64 +604,70 @@ class UNet {
       rawTileTensor.dispose();
     }
 
-    const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
-    tileTensor.dispose();
+    let outBuffer: GPUBuffer;
+    ENGINE.tidy(() => {
+      const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
+      tileTensor.dispose();
 
-    const dstWidth = Math.min(dstTileSize.width, width);
-    const dstHeight = Math.min(dstTileSize.height, height);
-    const dstTile = new Tile(i * dstWidth, j * dstHeight, dstWidth, dstHeight);
-    dstTile.width = Math.min(dstTile.width, width - dstTile.x);
-    dstTile.height = Math.min(dstTile.height, height - dstTile.y);
-
-    if (inputData instanceof Float32Array) {
-      let denoisedData = outputTensor.dataSync();
-      if (isHDR) {
-        denoisedData = hdrTransferFuncInverseCPU({
-          data: denoisedData as Float32Array,
-          channels: 3,
-          inputScale
-        });
-      }
-
-      this._writeTile(
-        outputImageData!,
-        srcTile,
-        dstTile,
-        denoisedData as Float32Array,
-        srcTileSize.width,
-        isHDR
+      const dstWidth = Math.min(dstTileSize.width, width);
+      const dstHeight = Math.min(dstTileSize.height, height);
+      const dstTile = new Tile(
+        i * dstWidth,
+        j * dstHeight,
+        dstWidth,
+        dstHeight
       );
+      dstTile.width = Math.min(dstTile.width, width - dstTile.x);
+      dstTile.height = Math.min(dstTile.height, height - dstTile.y);
 
-      for (let y = 0; y < dstHeight; y++) {
-        for (let x = 0; x < dstWidth; x++) {
-          const i1 = (y * dstWidth + x) * 4;
-          const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
-          for (let c = 0; c < 4; c++) {
-            outputTileData!.data[i1 + c] = outputImageData!.data[i2 + c];
+      if (inputData instanceof Float32Array) {
+        let denoisedData = outputTensor.dataSync();
+        if (isHDR) {
+          denoisedData = hdrTransferFuncInverseCPU({
+            data: denoisedData as Float32Array,
+            channels: 3,
+            inputScale
+          });
+        }
+
+        this._writeTile(
+          outputImageData!,
+          srcTile,
+          dstTile,
+          denoisedData as Float32Array,
+          srcTileSize.width,
+          isHDR
+        );
+
+        for (let y = 0; y < dstHeight; y++) {
+          for (let x = 0; x < dstWidth; x++) {
+            const i1 = (y * dstWidth + x) * 4;
+            const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
+            for (let c = 0; c < 4; c++) {
+              outputTileData!.data[i1 + c] = outputImageData!.data[i2 + c];
+            }
           }
         }
-      }
 
-      outputTensor.dispose();
-    } else {
-      dataProcessGPU!.setOutputTile(dstTile, srcTile);
-      // IMPORTANT
-      // storage buffer has alignment. that 3 channels still needs 16 bytes data.
-      // So we need to pad it to 4 channels.
-      const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
-        [0, 0],
-        [0, 0],
-        [0, 0],
-        [0, 1]
-      ]);
-      const outBuffer = dataProcessGPU!.inverse(
-        outputTensor4Channnels.dataToGPU().buffer!,
-        inputData.color
-      );
-      outputTensor.dispose();
-      outputTensor4Channnels.dispose();
-      return outBuffer;
-    }
+        outputTensor.dispose();
+      } else {
+        dataProcessGPU!.setOutputTile(dstTile, srcTile);
+        // IMPORTANT
+        // storage buffer has alignment. that 3 channels still needs 16 bytes data.
+        // So we need to pad it to 4 channels.
+        const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
+          [0, 0],
+          [0, 0],
+          [0, 0],
+          [0, 1]
+        ]);
+        outBuffer = dataProcessGPU!.inverse(
+          outputTensor4Channnels.dataToGPU().buffer!,
+          inputData.color
+        );
+      }
+    });
+    return outBuffer!;
   }
 
   tileExecute<T extends ImageData | HDRImageData | GPUImageData>({
@@ -779,6 +786,7 @@ class UNet {
           }
         });
       } else {
+        // console.log(memory());
         done(output as any);
       }
     };

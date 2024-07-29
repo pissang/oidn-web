@@ -33,3 +33,11 @@ export function profileAndLogKernelCode(execute: () => void, disabled = true) {
       console.log(code);
     });
 }
+
+export function memory() {
+  return tfjs.memory();
+}
+
+export function tidy(f: () => void) {
+  return tfjs.tidy(f);
+}
