@@ -14,6 +14,7 @@ import {
 import { MaxPooling2D } from '@tensorflow/tfjs-layers/dist/layers/pooling';
 import { Concatenate } from '@tensorflow/tfjs-layers/dist/layers/merge';
 import { LayersModel } from '@tensorflow/tfjs-layers/dist/engine/training';
+import type { Layer } from '@tensorflow/tfjs-layers/dist/engine/topology';
 import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_layer';
 import { HostTensor } from './tza';
 import { Float16Array } from '@petamoriken/float16';
@@ -123,8 +124,10 @@ class UNet {
 
   private _maxTileSize;
 
+  private _tensors = new Map<string, Tensor>();
+
   constructor(
-    private _tensors: Map<string, HostTensor>,
+    private _hostTensors: Map<string, HostTensor>,
     private _backend: WebGPUBackend,
     opts: {
       /**
@@ -179,21 +182,33 @@ class UNet {
     source: SymbolicTensor,
     activation?: 'relu'
   ) {
-    const unetWeightTensor = this._tensors.get(name + '.weight')!;
-    const unetBiasTensor = this._tensors.get(name + '.bias')!;
-    const weightDims = unetWeightTensor.desc.dims;
-    const weightTensor = tensor(
-      changeWeightShapes(
-        getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
-        weightDims
-      ),
-      [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
-      'float32'
-    );
-    const biasTensor = tensor1d(
-      getTensorData(unetBiasTensor.data, unetBiasTensor.desc.dataType),
-      'float32'
-    );
+    const weightTensorName = name + '.weight';
+    const biasTensorName = name + '.bias';
+    const tensors = this._tensors;
+    let weightTensor = tensors.get(weightTensorName);
+    let biasTensor = tensors.get(biasTensorName);
+    const unetWeightTensor = this._hostTensors.get(weightTensorName)!;
+
+    if (!weightTensor) {
+      const weightDims = unetWeightTensor.desc.dims;
+      weightTensor = tensor(
+        changeWeightShapes(
+          getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
+          weightDims
+        ),
+        [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
+        'float32'
+      );
+      tensors.set(weightTensorName, weightTensor);
+    }
+    if (!biasTensor) {
+      const unetBiasTensor = this._hostTensors.get(name + '.bias')!;
+      biasTensor = tensor1d(
+        getTensorData(unetBiasTensor.data, unetBiasTensor.desc.dataType),
+        'float32'
+      );
+      tensors.set(biasTensorName, biasTensor);
+    }
     // TODO whats the purpose of padded dims ?
     const convLayer = new Conv2D({
       name,
@@ -214,11 +229,12 @@ class UNet {
     source1: SymbolicTensor,
     source2: SymbolicTensor
   ) {
+    const concatLayer = new Concatenate({ trainable: false, axis: 3 });
     //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
     return this._createConv(
       name,
       // Concat on the channel
-      new Concatenate({ trainable: false, axis: 3 }).apply([
+      concatLayer.apply([
         // convLayer.apply(source2) as SymbolicTensor,
         source1,
         source2
@@ -228,22 +244,24 @@ class UNet {
   }
 
   private _createPooling(source: SymbolicTensor) {
-    // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
-    return new MaxPooling2D({
+    const poolingLayer = new MaxPooling2D({
       name: source.name + '/pooling',
       poolSize: [2, 2],
       strides: [2, 2],
       padding: 'same',
       trainable: false
-    }).apply(source) as SymbolicTensor;
+    });
+    // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
+    return poolingLayer.apply(source) as SymbolicTensor;
   }
 
   private _addUpsamplingLayer(source: SymbolicTensor) {
-    return new UpSampling2D({
+    const upsamplingLayer = new UpSampling2D({
       name: source.name + '/upsampling',
       size: [2, 2],
       trainable: false
-    }).apply(source) as SymbolicTensor;
+    });
+    return upsamplingLayer.apply(source) as SymbolicTensor;
   }
 
   private _addNet(input: SymbolicTensor) {
@@ -775,6 +793,7 @@ class UNet {
   dispose() {
     this._tfModel?.dispose();
     this._dataProcessGPU?.dispose();
+    this._tensors.forEach((tensor) => tensor.dispose());
   }
 }
 
