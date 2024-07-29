@@ -27,7 +27,7 @@ import {
 } from './process';
 import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
 
-import { profileAndLogKernelCode, memory } from './helper';
+// import { profileAndLogKernelCode, memory } from './helper';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -775,7 +775,7 @@ class UNet {
           }
         });
       } else {
-        console.log(memory());
+        // console.log(memory());
         done(output as any);
       }
     };
