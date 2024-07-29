@@ -27,7 +27,7 @@ import {
 } from './process';
 import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
 
-// import { profileAndLogKernelCode, memory } from './helper';
+import { profileAndLogKernelCode, memory } from './helper';
 
 function getTensorData(
   ubytes: Uint8Array,
@@ -200,6 +200,7 @@ class UNet {
         [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
         'float32'
       );
+
       tensors.set(weightTensorName, weightTensor);
     }
     if (!biasTensor) {
@@ -353,24 +354,24 @@ class UNet {
       tileOverlapY = 0;
     }
 
-    // if (
-    //   tileWidth !== this._tileWidth ||
-    //   tileHeight !== this._tileHeight ||
-    //   tileOverlapX !== this._tileOverlapX ||
-    //   tileOverlapY !== this._tileOverlapY ||
-    //   !this._tfModel
-    // ) {
-    this._tileWidth = tileWidth;
-    this._tileHeight = tileHeight;
-    this._tileOverlapX = tileOverlapX;
-    this._tileOverlapY = tileOverlapY;
+    if (
+      tileWidth !== this._tileWidth ||
+      tileHeight !== this._tileHeight ||
+      tileOverlapX !== this._tileOverlapX ||
+      tileOverlapY !== this._tileOverlapY ||
+      !this._tfModel
+    ) {
+      this._tileWidth = tileWidth;
+      this._tileHeight = tileHeight;
+      this._tileOverlapX = tileOverlapX;
+      this._tileOverlapY = tileOverlapY;
 
-    if (this._tfModel) {
-      this._tfModel.dispose();
+      if (this._tfModel) {
+        this._tfModel.dispose();
+      }
+
+      this._buildModel(isLarge);
     }
-
-    this._buildModel(isLarge);
-    // }
   }
 
   private _getTileSizeWithOverlap() {
@@ -573,7 +574,6 @@ class UNet {
           [0, 0, 0, 0],
           [1, srcTileHeight, srcTileWidth, 3]
         );
-        tmp.dispose();
         return ret;
       };
 
@@ -582,8 +582,6 @@ class UNet {
           createTensor(buffer!)
         );
         tileTensor = concat4d(tensors, 3);
-        // TODO reuse tensors?
-        tensors.forEach((t) => t.dispose());
       } else {
         tileTensor = createTensor(color);
       }
@@ -601,72 +599,61 @@ class UNet {
         ],
         'reflect'
       );
-      rawTileTensor.dispose();
     }
 
     let outBuffer: GPUBuffer;
-    ENGINE.tidy(() => {
-      const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
-      tileTensor.dispose();
+    const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
 
-      const dstWidth = Math.min(dstTileSize.width, width);
-      const dstHeight = Math.min(dstTileSize.height, height);
-      const dstTile = new Tile(
-        i * dstWidth,
-        j * dstHeight,
-        dstWidth,
-        dstHeight
+    const dstWidth = Math.min(dstTileSize.width, width);
+    const dstHeight = Math.min(dstTileSize.height, height);
+    const dstTile = new Tile(i * dstWidth, j * dstHeight, dstWidth, dstHeight);
+    dstTile.width = Math.min(dstTile.width, width - dstTile.x);
+    dstTile.height = Math.min(dstTile.height, height - dstTile.y);
+
+    if (inputData instanceof Float32Array) {
+      let denoisedData = outputTensor.dataSync();
+      if (isHDR) {
+        denoisedData = hdrTransferFuncInverseCPU({
+          data: denoisedData as Float32Array,
+          channels: 3,
+          inputScale
+        });
+      }
+
+      this._writeTile(
+        outputImageData!,
+        srcTile,
+        dstTile,
+        denoisedData as Float32Array,
+        srcTileSize.width,
+        isHDR
       );
-      dstTile.width = Math.min(dstTile.width, width - dstTile.x);
-      dstTile.height = Math.min(dstTile.height, height - dstTile.y);
 
-      if (inputData instanceof Float32Array) {
-        let denoisedData = outputTensor.dataSync();
-        if (isHDR) {
-          denoisedData = hdrTransferFuncInverseCPU({
-            data: denoisedData as Float32Array,
-            channels: 3,
-            inputScale
-          });
-        }
-
-        this._writeTile(
-          outputImageData!,
-          srcTile,
-          dstTile,
-          denoisedData as Float32Array,
-          srcTileSize.width,
-          isHDR
-        );
-
-        for (let y = 0; y < dstHeight; y++) {
-          for (let x = 0; x < dstWidth; x++) {
-            const i1 = (y * dstWidth + x) * 4;
-            const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
-            for (let c = 0; c < 4; c++) {
-              outputTileData!.data[i1 + c] = outputImageData!.data[i2 + c];
-            }
+      for (let y = 0; y < dstHeight; y++) {
+        for (let x = 0; x < dstWidth; x++) {
+          const i1 = (y * dstWidth + x) * 4;
+          const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
+          for (let c = 0; c < 4; c++) {
+            outputTileData!.data[i1 + c] = outputImageData!.data[i2 + c];
           }
         }
-
-        outputTensor.dispose();
-      } else {
-        dataProcessGPU!.setOutputTile(dstTile, srcTile);
-        // IMPORTANT
-        // storage buffer has alignment. that 3 channels still needs 16 bytes data.
-        // So we need to pad it to 4 channels.
-        const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
-          [0, 0],
-          [0, 0],
-          [0, 0],
-          [0, 1]
-        ]);
-        outBuffer = dataProcessGPU!.inverse(
-          outputTensor4Channnels.dataToGPU().buffer!,
-          inputData.color
-        );
       }
-    });
+    } else {
+      dataProcessGPU!.setOutputTile(dstTile, srcTile);
+      // IMPORTANT
+      // storage buffer has alignment. that 3 channels still needs 16 bytes data.
+      // So we need to pad it to 4 channels.
+      const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
+        [0, 0],
+        [0, 0],
+        [0, 0],
+        [0, 1]
+      ]);
+      outBuffer = dataProcessGPU!.inverse(
+        outputTensor4Channnels.dataToGPU().buffer!,
+        inputData.color
+      );
+    }
     return outBuffer!;
   }
 
@@ -746,6 +733,7 @@ class UNet {
       }
       let resGPUBuffer;
       // profileAndLogKernelCode(() => {
+      ENGINE.startScope();
       resGPUBuffer = this._executeTile(
         isGPUImageData(color)
           ? {
@@ -762,6 +750,7 @@ class UNet {
         height,
         hdr
       );
+      ENGINE.endScope();
       // }, true);
       const output = outputImageData || {
         data: resGPUBuffer,
@@ -786,7 +775,7 @@ class UNet {
           }
         });
       } else {
-        // console.log(memory());
+        console.log(memory());
         done(output as any);
       }
     };
