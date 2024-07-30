@@ -126,6 +126,7 @@ class UNet {
   private _maxTileSize;
 
   private _tensors = new Map<string, Tensor>();
+  private _modelsCache = new Map<string, LayersModel>();
 
   constructor(
     private _hostTensors: Map<string, HostTensor>,
@@ -150,7 +151,7 @@ class UNet {
     this._hdr = opts.hdr || false;
     this._denoiseAlpha = opts.denoiseAlpha || false;
 
-    this._maxTileSize = opts.maxTileSize ?? 512;
+    this._maxTileSize = roundUp(opts.maxTileSize ?? 512, 2);
 
     this._device = this._backend.device;
   }
@@ -163,19 +164,30 @@ class UNet {
     const aux = this._aux;
     const channels = 3 + (aux ? 6 : 0);
     const tileSize = this._getTileSizeWithOverlap();
+    const cache = this._modelsCache;
+    const key = [tileSize.width, tileSize.height].join(',');
 
-    // TODO input process transferFunc
-    // TODO input shape
+    // We cache the model instead of disposing and recreate.
+    // Because seems tfjs will also cache the layer and gpubuffers.
+    // Recreating the model will cause memory leak.
+
+    // Width and height can only be 256, 512, 768. So the cache won't be too large
+    if (cache.has(key)) {
+      this._tfModel = cache.get(key);
+      return;
+    }
+
     const input = TFInput({
+      name: 'input',
       shape: [tileSize.height, tileSize.width, channels],
       dtype: 'float32'
     });
 
     this._tfModel = new LayersModel({
       inputs: [input],
-      // TODO output process transferFunc
       outputs: isLarge ? this._addNetLarge(input) : this._addNet(input)
     });
+    cache.set(key, this._tfModel);
   }
 
   private _createConv(
@@ -231,16 +243,16 @@ class UNet {
     source1: SymbolicTensor,
     source2: SymbolicTensor
   ) {
-    const concatLayer = new Concatenate({ trainable: false, axis: 3 });
+    const concatLayer = new Concatenate({
+      name: name + '/concat',
+      trainable: false,
+      axis: 3
+    });
     //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
     return this._createConv(
       name,
       // Concat on the channel
-      concatLayer.apply([
-        // convLayer.apply(source2) as SymbolicTensor,
-        source1,
-        source2
-      ]) as SymbolicTensor,
+      concatLayer.apply([source1, source2]) as SymbolicTensor,
       'relu'
     ) as SymbolicTensor;
   }
@@ -346,13 +358,25 @@ class UNet {
     let tileOverlapY = isLarge ? defaultTileOverlapLarge : defaultTileOverlap;
 
     if (width < maxTileSize + defaultTileOverlap * 2) {
-      tileWidth = roundUp(width, tileAlignment);
-      tileOverlapX = 0;
+      tileWidth = roundUp(width, maxTileSize / 2);
+      if (width <= maxTileSize) {
+        tileOverlapX = 0;
+      }
     }
     if (height < maxTileSize + defaultTileOverlap * 2) {
-      tileHeight = roundUp(height, tileAlignment);
-      tileOverlapY = 0;
+      tileHeight = roundUp(height, maxTileSize / 2);
+      if (height <= maxTileSize) {
+        tileOverlapY = 0;
+      }
     }
+
+    // Force width and height has same size. reduce the cache in memory
+    const tileSize = Math.max(tileWidth, tileHeight);
+    const tileOverlap = Math.max(tileOverlapX, tileOverlapY);
+    tileWidth = tileSize;
+    tileHeight = tileSize;
+    tileOverlapX = tileOverlap;
+    tileOverlapY = tileOverlap;
 
     if (
       tileWidth !== this._tileWidth ||
@@ -361,14 +385,11 @@ class UNet {
       tileOverlapY !== this._tileOverlapY ||
       !this._tfModel
     ) {
+      // console.log(tileWidth, tileHeight, tileOverlapX, tileOverlapY);
       this._tileWidth = tileWidth;
       this._tileHeight = tileHeight;
       this._tileOverlapX = tileOverlapX;
       this._tileOverlapY = tileOverlapY;
-
-      if (this._tfModel) {
-        this._tfModel.dispose();
-      }
 
       this._buildModel(isLarge);
     }
@@ -513,10 +534,9 @@ class UNet {
     let srcY1 = Math.min(srcY0 + srcTileSize.height, height);
     srcY0 = Math.max(srcY1 - srcTileSize.height, 0);
 
-    const srcTileWidth = Math.min(srcTileSize.width, width);
-    const srcTileHeight = Math.min(srcTileSize.height, height);
-    const needsResize =
-      width < dstTileSize.width || height < dstTileSize.height;
+    const srcTileWidth = srcTileSize.width;
+    const srcTileHeight = srcTileSize.height;
+
     const srcTile = new Tile(srcX0, srcY0, srcTileWidth, srcTileHeight);
 
     let tileTensor!: Tensor;
@@ -585,20 +605,6 @@ class UNet {
       } else {
         tileTensor = createTensor(color);
       }
-    }
-    // We need resize if input size is smaller than tile size. And is rounded up.
-    if (needsResize) {
-      const rawTileTensor = tileTensor;
-      tileTensor = mirrorPad(
-        rawTileTensor,
-        [
-          [0, 0],
-          [0, srcTileSize.height - height],
-          [0, srcTileSize.width - width],
-          [0, 0]
-        ],
-        'reflect'
-      );
     }
 
     let outBuffer: GPUBuffer;
