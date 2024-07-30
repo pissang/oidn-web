@@ -148,9 +148,6 @@ export class GPUDataProcess {
 
   private _isInputTexture = false;
 
-  private _width = 0;
-  private _height = 0;
-
   constructor(
     private _device: GPUDevice,
     private _isHDR: boolean,
@@ -233,6 +230,7 @@ export class GPUDataProcess {
     this._copyPass = new WGPUComputePass('copyPass', this._device, {
       inputs: ['color'],
       outputs: ['color'],
+      autoUpdateOutputBuffer: false,
       uniforms: [
         {
           label: 'size',
@@ -367,9 +365,8 @@ else {
     this._inputPassColor.setUniform('inputSize', new Float32Array([w, h]));
     this._outputPass.setUniform('imageSize', new Float32Array([w, h]));
     this._outputPass.setSize(w, h);
-
-    this._width = w;
-    this._height = h;
+    this._copyPass.setSize(w, h);
+    this._copyPass.setUniform('size', new Float32Array([w, h]));
   }
 
   setInputTile(tile: Tile) {
@@ -470,9 +467,6 @@ else {
     const copyPass = this._copyPass;
 
     if (inputColorBuffer instanceof GPUTexture) {
-      const size = new Float32Array([this._width, this._height]);
-      copyPass.setUniform('size', size);
-      copyPass.setSize(size[0], size[1]);
       copyPass.setOutputBuffers({
         color: colorBuffer
       });

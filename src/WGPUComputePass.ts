@@ -23,7 +23,7 @@ export interface WGPUComputePassOutput {
 }
 
 export class WGPUComputePass<I extends string, O extends string> {
-  private autoUpdateOutputBuffer = true;
+  autoUpdateOutputBuffer = true;
 
   private _label;
 
@@ -71,6 +71,7 @@ export class WGPUComputePass<I extends string, O extends string> {
       csMain: string;
       csDefine?: string;
       uniforms: Uniform[];
+      autoUpdateOutputBuffer?: boolean;
     }
   ) {
     this._label = label;
@@ -80,6 +81,7 @@ export class WGPUComputePass<I extends string, O extends string> {
     this._inputs = opts.inputs;
     this._outputs = opts.outputs;
     this._uniforms = opts.uniforms;
+    this.autoUpdateOutputBuffer = opts.autoUpdateOutputBuffer ?? true;
 
     opts.uniforms.forEach((uniform) => {
       this._uniformBuffers[uniform.label] = device.createBuffer({
@@ -143,6 +145,10 @@ export class WGPUComputePass<I extends string, O extends string> {
   }
 
   getOutput(name: O) {
+    if (this._needsResizeBuffer && this.autoUpdateOutputBuffer) {
+      this._resizeOutputBuffers();
+      this._needsResizeBuffer = false;
+    }
     return this._outputBuffers[name].buffer;
   }
 
