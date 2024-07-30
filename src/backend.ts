@@ -48,12 +48,12 @@ export async function initWebGPUBackendWithDevice(
   // TODO multiple device and adapter in one backend
   let backend = ENGINE.findBackend('webgpu-oidn');
   if (backend != null) {
-    return backend;
+    return backend as WebGPUBackend;
   }
 
   backend = new WebGPUBackend(device, adapter);
   ENGINE.registerBackend('webgpu-oidn', () => backend);
   await ENGINE.setBackend('webgpu-oidn');
 
-  return backend;
+  return backend as WebGPUBackend;
 }
