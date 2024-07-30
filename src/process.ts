@@ -148,11 +148,7 @@ export class GPUDataProcess {
 
   private _isInputTexture = false;
 
-  constructor(
-    private _device: GPUDevice,
-    private _isHDR: boolean,
-    private _denoiseAlpha: boolean
-  ) {
+  constructor(private _device: GPUDevice, private _isHDR: boolean) {
     const commonUniforms = [
       {
         label: 'inputScale',
@@ -256,14 +252,13 @@ out_color[outIdx] = textureLoad(in_color, globalId.xy, 0);
     });
   }
 
-  private _updatePasses(isInputTexture: boolean) {
+  private _updatePasses(isInputTexture: boolean, denoiseAlpha = false) {
     if (this._isInputTexture === isInputTexture) {
       return;
     }
 
     this._isInputTexture = isInputTexture;
     const isHDR = this._isHDR;
-    const denoiseAlpha = this._denoiseAlpha;
     const commonCSDefine = /* wgsl */ `
 ${constsCode}
 fn PUForward(y: f32) -> f32 {
@@ -289,7 +284,8 @@ let col = ${readInputCode('color')};
 let outIdx = i32(y * outputSize.x + x);
 
 if (${denoiseAlpha}) {
-  out_color[outIdx] = vec3f(col.a);
+  // Denoise the inversed alpha. Or the anti aliased edge will be too dark after denoised
+  out_color[outIdx] = vec3f(1.0 - col.a);
 }
 else if (${isHDR}) {
   out_color[outIdx] = vec3f(PUForward(col.r * inputScale), PUForward(col.g * inputScale), PUForward(col.b * inputScale)) * normScale;
@@ -344,7 +340,7 @@ let raw = ${
       };
 
 if (${denoiseAlpha}) {
-  out_color[outIdx] = vec4f(raw.rgb, col.r);
+  out_color[outIdx] = vec4f(raw.rgb, 1.0 - col.r);
 }
 else if (${isHDR}) {
   out_color[outIdx] = vec4f(
@@ -398,10 +394,12 @@ else {
     colorBuffer: GPUBuffer | GPUTexture,
     // TODO optional albedo and normal.
     albedoBuffer: GPUBuffer | GPUTexture | undefined,
-    normalBuffer: GPUBuffer | GPUTexture | undefined
+    normalBuffer: GPUBuffer | GPUTexture | undefined,
+
+    denoiseAlpha: boolean | undefined
   ) {
     const isInputTexture = colorBuffer instanceof GPUTexture;
-    this._updatePasses(isInputTexture);
+    this._updatePasses(isInputTexture, denoiseAlpha);
 
     const inputPassAux = this._inputPassAux;
     const inputPassColor = this._inputPassColor;

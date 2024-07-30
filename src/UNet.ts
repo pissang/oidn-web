@@ -119,7 +119,6 @@ class UNet {
 
   private _aux;
   private _hdr;
-  private _denoiseAlpha;
 
   private _dataProcessGPU?: GPUDataProcess;
 
@@ -140,16 +139,11 @@ class UNet {
        * If input is HDR image.
        */
       hdr?: boolean;
-      /**
-       * If denoise alpha channel. Otherwise denoise RGB channels.
-       */
-      denoiseAlpha?: boolean;
       maxTileSize?: number;
     } = {}
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
-    this._denoiseAlpha = opts.denoiseAlpha || false;
 
     this._maxTileSize = roundUp(opts.maxTileSize ?? 512, 2);
 
@@ -518,7 +512,8 @@ class UNet {
     j: number,
     width: number,
     height: number,
-    isHDR: boolean
+    isHDR: boolean,
+    denoiseAlpha?: boolean
   ) {
     const channels = this._aux ? 9 : 3;
     const tileOverlapX = this._tileOverlapX;
@@ -566,8 +561,7 @@ class UNet {
       if (!dataProcessGPU) {
         dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(
           device,
-          isHDR,
-          this._denoiseAlpha
+          isHDR
         );
       }
       dataProcessGPU.setImageSize(width, height);
@@ -579,7 +573,8 @@ class UNet {
       const { color, albedo, normal } = dataProcessGPU.forward(
         inputData.color,
         this._aux ? inputData.albedo : undefined,
-        this._aux ? inputData.normal : undefined
+        this._aux ? inputData.normal : undefined,
+        denoiseAlpha
       );
 
       const createTensor = (buffer: GPUBuffer) => {
@@ -668,11 +663,16 @@ class UNet {
     albedo,
     normal,
     done,
-    progress
+    progress,
+    denoiseAlpha
   }: {
     color: T;
     albedo?: ImageData | GPUImageData;
     normal?: ImageData | GPUImageData;
+    /**
+     * If denoise alpha channel. Otherwise denoise RGB channels.
+     */
+    denoiseAlpha?: boolean;
     done: (outputData: T extends GPUImageData ? GPUImageDataOutput : T) => void;
     progress?: (
       outputData: T extends GPUImageData ? GPUImageDataOutput : T,
@@ -754,7 +754,8 @@ class UNet {
         j,
         width,
         height,
-        hdr
+        hdr,
+        denoiseAlpha
       );
       ENGINE.endScope();
       // }, true);
