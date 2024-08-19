@@ -146,7 +146,7 @@ export class GPUDataProcess {
   private _outputPass;
   private _copyPass;
 
-  private _isInputTexture = false;
+  private _isInputTexture?: boolean;
 
   constructor(private _device: GPUDevice, private _isHDR: boolean) {
     const commonUniforms = [
@@ -253,7 +253,10 @@ out_color[outIdx] = textureLoad(in_color, globalId.xy, 0);
   }
 
   private _updatePasses(isInputTexture: boolean, denoiseAlpha = false) {
-    if (this._isInputTexture === isInputTexture) {
+    if (
+      this._isInputTexture != undefined &&
+      this._isInputTexture === isInputTexture
+    ) {
       return;
     }
 
@@ -273,7 +276,7 @@ fn PUForward(y: f32) -> f32 {
     function readInputCode(inputName: string) {
       return isInputTexture
         ? `textureLoad(in_${inputName}, globalId.xy + vec2u(inputOffset), 0)`
-        : `in_${inputName}[inIdx]'`;
+        : `in_${inputName}[inIdx]`;
     }
     const commonCSMain = /* wgsl */ `
 let x = f32(globalId.x);
