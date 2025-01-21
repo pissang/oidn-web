@@ -343,7 +343,7 @@ class UNet {
   }
 
   private _updateModel(width: number, height: number) {
-    const isLarge = this._tensors.has('enc_conv1b.weight');
+    const isLarge = this._hostTensors.has('enc_conv1b.weight');
     const maxTileSize = this._maxTileSize;
 
     let tileWidth = maxTileSize;
