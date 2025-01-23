@@ -1,6 +1,6 @@
 {
   "name": "oidn-web",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Run Open Image Denoiser on the Web",
   "main": "lib/main.js",
   "types": "lib/main.d.ts",
@@ -17,8 +17,8 @@
   "license": "MIT",
   "dependencies": {
     "@petamoriken/float16": "^3.8.7",
-    "@tensorflow/tfjs": "^4.22.0",
-    "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
+    "@tensorflow/tfjs": "4.20.0",
+    "@tensorflow/tfjs-backend-webgpu": "4.20.0"
   },
   "devDependencies": {
     "typescript": "^5.7.3",
