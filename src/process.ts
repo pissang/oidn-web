@@ -157,18 +157,18 @@ export class GPUDataProcess {
       },
       {
         label: 'inputSize',
-        type: 'vec2<f32>',
-        data: new Float32Array(2)
+        type: 'vec2i',
+        data: new Int32Array(2)
       },
       {
         label: 'outputSize',
-        type: 'vec2<f32>',
-        data: new Float32Array(2)
+        type: 'vec2i',
+        data: new Int32Array(2)
       },
       {
         label: 'inputOffset',
-        type: 'vec2<f32>',
-        data: new Float32Array(2)
+        type: 'vec2i',
+        data: new Int32Array(2)
       }
     ];
     this._inputPassAux = new WGPUComputePass('inputPassAux', this._device, {
@@ -196,28 +196,28 @@ export class GPUDataProcess {
         },
         {
           label: 'inputSize',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         },
         {
           label: 'outputSize',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         },
         {
           label: 'imageSize',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         },
         {
           label: 'inputOffset',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         },
         {
           label: 'outputOffset',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         }
       ],
       csDefine: '',
@@ -230,8 +230,8 @@ export class GPUDataProcess {
       uniforms: [
         {
           label: 'size',
-          type: 'vec2<f32>',
-          data: new Float32Array(2)
+          type: 'vec2i',
+          data: new Int32Array(2)
         }
       ],
       csMain: /*wgsl*/ `
@@ -279,12 +279,12 @@ fn PUForward(y: f32) -> f32 {
         : `in_${inputName}[inIdx]`;
     }
     const commonCSMain = /* wgsl */ `
-let x = f32(globalId.x);
-let y = f32(globalId.y);
-let inIdx = i32((y + inputOffset.y) * inputSize.x + (x + inputOffset.x));
+let x = i32(globalId.x);
+let y = i32(globalId.y);
+let inIdx = (y + inputOffset.y) * inputSize.x + (x + inputOffset.x);
 let col = ${readInputCode('color')};
 
-let outIdx = i32(y * outputSize.x + x);
+let outIdx = y * outputSize.x + x;
 
 if (${denoiseAlpha}) {
   // Denoise the inversed alpha. Or the anti aliased edge will be too dark after denoised
@@ -328,13 +328,13 @@ fn PUInverse(y: f32) -> f32 {
 }
 `,
       csMain: /* wgsl */ `
-let x = f32(globalId.x);
-let y = f32(globalId.y);
+let x = i32(globalId.x);
+let y = i32(globalId.y);
 if (x >= outputSize.x || y >= outputSize.y) {
   return;
 }
-let inIdx = i32((y + inputOffset.y) * inputSize.x + x + inputOffset.x);
-let outIdx = i32((y + outputOffset.y) * imageSize.x + x + outputOffset.x);
+let inIdx = (y + inputOffset.y) * inputSize.x + x + inputOffset.x;
+let outIdx = (y + outputOffset.y) * imageSize.x + x + outputOffset.x;
 let col = in_color[inIdx];
 let raw = ${
         isInputTexture
@@ -360,18 +360,18 @@ else {
   }
 
   setImageSize(w: number, h: number) {
-    this._inputPassAux.setUniform('inputSize', new Float32Array([w, h]));
-    this._inputPassColor.setUniform('inputSize', new Float32Array([w, h]));
-    this._outputPass.setUniform('imageSize', new Float32Array([w, h]));
+    this._inputPassAux.setUniform('inputSize', new Int32Array([w, h]));
+    this._inputPassColor.setUniform('inputSize', new Int32Array([w, h]));
+    this._outputPass.setUniform('imageSize', new Int32Array([w, h]));
     this._outputPass.setSize(w, h);
     this._copyPass.setSize(w, h);
-    this._copyPass.setUniform('size', new Float32Array([w, h]));
+    this._copyPass.setUniform('size', new Int32Array([w, h]));
   }
 
   setInputTile(tile: Tile) {
-    const size = new Float32Array([tile.width, tile.height]);
+    const size = new Int32Array([tile.width, tile.height]);
     [this._inputPassAux, this._inputPassColor].forEach((inputPass) => {
-      inputPass.setUniform('inputOffset', new Float32Array([tile.x, tile.y]));
+      inputPass.setUniform('inputOffset', new Int32Array([tile.x, tile.y]));
       inputPass.setUniform('outputSize', size);
       inputPass.setSize(size[0], size[1]);
     });
@@ -381,14 +381,14 @@ else {
 
   setOutputTile(dstTile: Tile, srcTile: Tile) {
     const outputPass = this._outputPass;
-    const size = new Float32Array([dstTile.width, dstTile.height]);
+    const size = new Int32Array([dstTile.width, dstTile.height]);
     const dx = dstTile.x - srcTile.x;
     const dy = dstTile.y - srcTile.y;
     outputPass.setUniform('outputSize', size);
-    outputPass.setUniform('inputOffset', new Float32Array([dx, dy]));
+    outputPass.setUniform('inputOffset', new Int32Array([dx, dy]));
     outputPass.setUniform(
       'outputOffset',
-      new Float32Array([dstTile.x, dstTile.y])
+      new Int32Array([dstTile.x, dstTile.y])
     );
     outputPass.setExecuteSize(size[0], size[1]);
   }
