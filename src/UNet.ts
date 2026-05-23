@@ -127,6 +127,9 @@ class UNet {
   private _tensors = new Map<string, Tensor>();
   private _modelsCache = new Map<string, LayersModel>();
 
+  // Cached pipelines for custom copyBufferToTexture rendering
+  private _bufferToTexturePipelines: Map<GPUTextureFormat, GPURenderPipeline> = new Map();
+
   constructor(
     private _hostTensors: Map<string, HostTensor>,
     private _backend: WebGPUBackend,
@@ -656,6 +659,160 @@ class UNet {
       );
     }
     return outBuffer!;
+  }
+
+  private _copyBufferToTexture(
+    commandEncoder: GPUCommandEncoder,
+    buffer: GPUBuffer,
+    texture: GPUTexture,
+    width: number,
+    height: number
+  ) {
+    // Fast path: if aligned to 256 bytes, natively copy.
+    if ((width * 16) % 256 === 0) {
+      commandEncoder.copyBufferToTexture(
+        { buffer, bytesPerRow: width * 16 },
+        { texture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        { width, height, depthOrArrayLayers: 1 }
+      );
+      return;
+    }
+
+    // Fallback: Custom render pass for unaligned resolutions
+    const device = this._device!;
+    let pipeline = this._bufferToTexturePipelines.get(texture.format);
+    
+    if (!pipeline) {
+      const shaderModule = device.createShaderModule({
+        code: `
+          struct VertexOutput {
+            @builtin(position) pos: vec4<f32>,
+          };
+          @vertex
+          fn vs_main(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+            let pos = array(
+              vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+              vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(1.0, 1.0)
+            );
+            var out: VertexOutput;
+            out.pos = vec4(pos[vertexIndex], 0.0, 1.0);
+            return out;
+          }
+
+          @group(0) @binding(0) var<storage, read> in_buf: array<vec4<f32>>;
+          @group(0) @binding(1) var<uniform> size: vec2<u32>;
+
+          @fragment
+          fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+            let coord = vec2<u32>(floor(in.pos.xy));
+            let idx = coord.y * size.x + coord.x;
+            return in_buf[idx];
+          }
+        `
+      });
+
+      pipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: { module: shaderModule, entryPoint: 'vs_main' },
+        fragment: {
+          module: shaderModule,
+          entryPoint: 'fs_main',
+          targets: [{ format: texture.format }]
+        },
+        primitive: { topology: 'triangle-list' }
+      });
+      this._bufferToTexturePipelines.set(texture.format, pipeline);
+    }
+
+    // FIX: Uniform buffers MUST be a multiple of 16 bytes in WebGPU.
+    const sizeBuffer = device.createBuffer({
+      size: 16, 
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    // Pad with zeroes to fill the 16 bytes
+    device.queue.writeBuffer(sizeBuffer, 0, new Uint32Array([width, height, 0, 0]));
+
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer } },
+        { binding: 1, resource: { buffer: sizeBuffer } }
+      ]
+    });
+
+    const pass = commandEncoder.beginRenderPass({
+      colorAttachments: [{
+        view: texture.createView(),
+        loadOp: 'clear',
+        storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 0 }
+      }]
+    });
+    
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(6);
+    pass.end();
+  }
+
+  /**
+   * Executes the denoiser synchronously across all tiles in a single CPU execution block,
+   * immediately issuing all WebGPU commands and optionally writing the output directly
+   * back to the provided output buffer/texture.
+   */
+  executeSync(opts: {
+    color: GPUImageData;
+    albedo?: GPUImageData;
+    normal?: GPUImageData;
+    output?: GPUImageData;
+    denoiseAlpha?: boolean;
+  }): GPUBuffer | undefined {
+    if (this._aux && (!opts.albedo || !opts.normal)) {
+      throw new Error('Normal map and albedo map are both required');
+    }
+
+    if (!this._aux && (opts.albedo || opts.normal)) {
+      throw new Error('Normal map and albedo map are not required');
+    }
+
+    const width = opts.color.width;
+    const height = opts.color.height;
+    this._updateModel(width, height);
+
+    const hdr = this._hdr || false;
+    const tileWidth = this._tileWidth;
+    const tileHeight = this._tileHeight;
+    const tileCountH = Math.ceil(height / tileHeight);
+    const tileCountW = Math.ceil(width / tileWidth);
+
+    let finalBuffer: GPUBuffer | undefined;
+
+    // Execute synchronously on CPU. This will block the JS thread briefly.
+    for (let j = 0; j < tileCountH; j++) {
+      for (let i = 0; i < tileCountW; i++) {
+        ENGINE.startScope();
+        finalBuffer = this._executeTile(
+          { color: opts.color.data, albedo: opts.albedo?.data, normal: opts.normal?.data },
+          undefined, undefined, i, j, width, height, hdr, opts.denoiseAlpha
+        ) as GPUBuffer;
+        ENGINE.endScope(); 
+      }
+    }
+
+    if (finalBuffer && opts.output) {
+      const device = this._device!;
+      const commandEncoder = device.createCommandEncoder();
+
+      if (opts.output.data instanceof GPUTexture) {
+        this._copyBufferToTexture(commandEncoder, finalBuffer, opts.output.data as GPUTexture, width, height);
+      } else if (opts.output.data instanceof GPUBuffer) {
+        commandEncoder.copyBufferToBuffer(finalBuffer, 0, opts.output.data as GPUBuffer, 0, width * height * 16);
+      }
+      // Submits OIDN's final output to the WebGPU queue
+      device.queue.submit([commandEncoder.finish()]);
+    }
+
+    return finalBuffer;
   }
 
   tileExecute<T extends ImageData | HDRImageData | GPUImageData>({
