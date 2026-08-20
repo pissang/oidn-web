@@ -12,7 +12,7 @@ It's used in the [Vector to 3D](https://www.figma.com/community/plugin/126460021
 ## How it works
 
 The OIDN U-Net runs directly on WebGPU with model-driven WGSL compute
-pipelines. TensorFlow.js is not used. Convolution activations use a blocked
+pipelines. Convolution activations use a blocked
 four-channel layout, decoder `upsample + concat + conv` patterns are fused,
 and all network dispatches for a tile are submitted in one command buffer.
 FP32 convolutions use channel-specialized implicit-GEMM tiles; FP16 uses
@@ -178,11 +178,15 @@ const requiredFeatures = adapter.features.has('shader-f16')
   : [];
 const device = await adapter.requestDevice({ requiredFeatures });
 
-const unet = await initUNetFromURL(modelUrl, { device, adapterInfo }, {
-  aux: true,
-  hdr: true,
-  precision: 'auto' // 'fp16' enforces support; 'fp32' is deterministic fallback
-});
+const unet = await initUNetFromURL(
+  modelUrl,
+  { device, adapterInfo },
+  {
+    aux: true,
+    hdr: true,
+    precision: 'auto' // 'fp16' enforces support; 'fp32' is deterministic fallback
+  }
+);
 
 console.log(unet.getRuntimeInfo());
 // { gpuEngine: 'wgsl', precision: 'fp16', model: 'oidn-unet-large-v1', ... }
