@@ -4,7 +4,10 @@ import type { UNetEngineSetting, UNetExecutionStats } from './UNet';
 import { initWebGPUBackend, initWebGPUBackendWithDevice } from './backend';
 import type { DynamicTileSetting } from './tileScheduler';
 import type { UNetModelSpec } from './modelSpec';
-import type { NativeUNetPrecisionSetting } from './nativeUNet';
+import type {
+  NativeUNetKernelSetting,
+  NativeUNetPrecisionSetting
+} from './nativeUNet';
 
 export { parseTZA, UNet };
 export type { DynamicTileOptions, DynamicTileSetting } from './tileScheduler';
@@ -34,6 +37,8 @@ export {
 } from './nativeUNet';
 export type {
   NativeUNetExecutionProfile,
+  NativeUNetKernel,
+  NativeUNetKernelSetting,
   NativeUNetLayerTiming,
   NativeUNetOptions,
   NativeUNetPrecision,
@@ -47,15 +52,19 @@ export interface UNetOptions {
   maxTileSize?: number;
   /** Adaptive GPU-time-based tile sizing. Enabled by default. */
   dynamicTile?: DynamicTileSetting;
-  /** Native WGSL engine selection. `auto` and `wgsl` are currently equivalent. */
+  /** `auto` uses stable WGSL; `webnn` opts into the experimental WebNN backend. */
   engine?: UNetEngineSetting;
   /** `auto` selects FP16 when shader-f16 was enabled on the GPUDevice. */
   precision?: NativeUNetPrecisionSetting;
+  /** `auto` selects kernels from precision, operation shape, and GPU limits. */
+  kernel?: NativeUNetKernelSetting;
   /** Versioned topology descriptor for future/custom OIDN TZA models. */
   modelSpec?: UNetModelSpec;
 }
 
 export type { UNetEngineSetting, UNetExecutionStats } from './UNet';
+export { WebNNUNetExecutor } from './webnnUNet';
+export type { WebNNRuntimeSupport, WebNNUNetOptions } from './webnnUNet';
 
 export async function initUNetFromBuffer(
   tzaBuffer: ArrayBuffer,

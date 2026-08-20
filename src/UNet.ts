@@ -20,10 +20,12 @@ import {
 } from './modelSpec';
 import {
   NativeUNetExecutor,
+  type NativeUNetKernelSetting,
   type NativeUNetPrecisionSetting
 } from './nativeUNet';
+import { WebNNUNetExecutor } from './webnnUNet';
 
-export type UNetEngineSetting = 'auto' | 'wgsl';
+export type UNetEngineSetting = 'auto' | 'wgsl' | 'webnn';
 
 interface HDRImageData {
   data: Float32Array;
@@ -83,7 +85,8 @@ class UNet {
   private _hdr;
 
   private _dataProcessGPU?: GPUDataProcess;
-  private _nativeExecutor: NativeUNetExecutor;
+  private _nativeExecutor?: NativeUNetExecutor;
+  private _webNNExecutor?: WebNNUNetExecutor;
   private _modelSpec: UNetModelSpec;
   private _inputChannels: number;
   private _engine: UNetEngineSetting;
@@ -109,6 +112,8 @@ class UNet {
       engine?: UNetEngineSetting;
       /** Arithmetic/storage precision used by the native WGSL engine. */
       precision?: NativeUNetPrecisionSetting;
+      /** Model-independent convolution kernel selection. */
+      kernel?: NativeUNetKernelSetting;
       /** Explicit descriptor for a new OIDN topology not in the built-in registry. */
       modelSpec?: UNetModelSpec;
     } = {}
@@ -135,27 +140,61 @@ class UNet {
     );
 
     this._device = backend.device;
-    this._nativeExecutor = new NativeUNetExecutor(
-      this._device,
-      validatedModel,
-      { precision: opts.precision }
-    );
+    if (this._engine === 'webnn') {
+      this._webNNExecutor = new WebNNUNetExecutor(
+        this._device,
+        validatedModel,
+        { precision: opts.precision }
+      );
+    } else {
+      this._nativeExecutor = new NativeUNetExecutor(
+        this._device,
+        validatedModel,
+        { precision: opts.precision, kernel: opts.kernel }
+      );
+    }
   }
 
   getDevice() {
     return this._device;
   }
 
-  /** Completes native pipeline compilation before first interactive use. */
+  /** Completes backend compilation before first interactive use. */
   async prepare() {
-    await this._nativeExecutor.prepare();
+    if (this._webNNExecutor) {
+      await this._webNNExecutor.prepare();
+      const overlap = roundUp(
+        this._modelSpec.receptiveField / 2,
+        OIDN_TILE_ALIGNMENT
+      );
+      const outputTileEdges = [
+        this._dynamicTileController.tileSize,
+        this._dynamicTileController.minTileSize
+      ];
+      await this._webNNExecutor.prewarm(
+        [...new Set(outputTileEdges)].map((edge) => ({
+          width: edge + 2 * overlap,
+          height: edge + 2 * overlap
+        }))
+      );
+      return;
+    }
+    await this._nativeExecutor!.prepare();
   }
 
   getRuntimeInfo() {
     return {
       configuredEngine: this._engine,
-      gpuEngine: 'wgsl' as const,
-      precision: this._nativeExecutor.precision,
+      gpuEngine: this._webNNExecutor ? 'webnn' as const : 'wgsl' as const,
+      precision: (this._webNNExecutor ?? this._nativeExecutor!).precision,
+      kernel: this._nativeExecutor
+        ? {
+            configured: this._nativeExecutor.kernelSetting,
+            maxSpatialInputBlocks: this._nativeExecutor.maxSpatialInputBlocks,
+            subgroupsAvailable: this._nativeExecutor.subgroupsAvailable
+          }
+        : undefined,
+      webnn: this._webNNExecutor?.support,
       model: this._modelSpec.id,
       modelFamily: this._modelSpec.family,
       inputChannels: this._inputChannels,
@@ -172,11 +211,11 @@ class UNet {
 
   /** Captures per-node GPU timestamps for the next native tile execution. */
   profileNextExecution() {
-    return this._nativeExecutor.profileNextExecution();
+    return this._nativeExecutor?.profileNextExecution() ?? false;
   }
 
   getLastExecutionProfile() {
-    return this._nativeExecutor.getLastExecutionProfile();
+    return this._nativeExecutor?.getLastExecutionProfile();
   }
 
   private _updateModel(width: number, height: number) {
@@ -384,7 +423,7 @@ class UNet {
           inputScale
         });
       }
-      denoisedData = await this._nativeExecutor.executeCPU(
+      denoisedData = await (this._webNNExecutor ?? this._nativeExecutor!).executeCPU(
         tileData,
         srcTileWidth,
         srcTileHeight
@@ -409,7 +448,7 @@ class UNet {
         denoiseAlpha
       );
 
-      nativeOutputBuffer = this._nativeExecutor.execute(
+      nativeOutputBuffer = await (this._webNNExecutor ?? this._nativeExecutor!).execute(
         this._aux ? [color, albedo!, normal!] : [color],
         srcTileWidth,
         srcTileHeight
@@ -651,7 +690,8 @@ class UNet {
 
   dispose() {
     this._dataProcessGPU?.dispose();
-    this._nativeExecutor.dispose();
+    this._nativeExecutor?.dispose();
+    this._webNNExecutor?.dispose();
   }
 }
 

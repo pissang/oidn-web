@@ -237,6 +237,9 @@ async function benchmarkVariant(browser, origin, options, variant) {
   try {
     const result = await page.evaluate(async (config) => {
       if (!navigator.gpu) throw new Error('WebGPU is unavailable');
+      if (config.engine === 'webnn' && !navigator.ml) {
+        return { skipped: 'WebNN is unavailable' };
+      }
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
       if (!adapter) throw new Error('No WebGPU adapter is available');
       const supportsFP16 = adapter.features.has('shader-f16');
@@ -244,6 +247,12 @@ async function benchmarkVariant(browser, origin, options, variant) {
         return { skipped: 'shader-f16 is unavailable' };
       }
       const requiredFeatures = config.precision === 'fp16' ? ['shader-f16'] : [];
+      if (config.kernel === 'subgroup') {
+        if (!adapter.features.has('subgroups')) {
+          return { skipped: 'subgroups is unavailable' };
+        }
+        requiredFeatures.push('subgroups');
+      }
       if (adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query');
       const device = await adapter.requestDevice({
         requiredFeatures,
@@ -265,15 +274,24 @@ async function benchmarkVariant(browser, origin, options, variant) {
         maxTileSize: config.tileSize
       };
       if (!config.baseline) {
-        runtimeOptions.engine = 'wgsl';
+        runtimeOptions.engine = config.engine ?? 'wgsl';
         runtimeOptions.precision = config.precision;
+        runtimeOptions.kernel = config.kernel;
         runtimeOptions.dynamicTile = false;
       }
-      const unet = await oidn.initUNetFromURL(
-        config.modelUrl,
-        { device, adapterInfo },
-        runtimeOptions
-      );
+      let unet;
+      try {
+        unet = await oidn.initUNetFromURL(
+          config.modelUrl,
+          { device, adapterInfo },
+          runtimeOptions
+        );
+      } catch (error) {
+        if (config.engine === 'webnn') {
+          return { skipped: String(error) };
+        }
+        throw error;
+      }
       const initializationMs = performance.now() - initStartedAt;
 
       const pixelCount = config.width * config.height;
@@ -397,6 +415,8 @@ async function benchmarkVariant(browser, origin, options, variant) {
       modelUrl: `${origin}/weights/rt_hdr_calb_cnrm_large.tza`,
       baseline: variant.baseline,
       precision: variant.precision,
+      kernel: variant.kernel,
+      engine: variant.engine,
       width: options.width,
       height: options.height,
       tileSize: options.tileSize,
@@ -505,12 +525,56 @@ async function main() {
     browser = await chromium.launch({
       executablePath: chrome,
       headless: true,
-      args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan,UseSkiaRenderer']
+      args: [
+        '--enable-unsafe-webgpu',
+        '--enable-features=Vulkan,UseSkiaRenderer,WebMachineLearningNeuralNetwork'
+      ]
     });
     const variants = [
       { label: `TFJS (${baselineCommit.slice(0, 7)})`, bundle: 'baseline', baseline: true },
-      { label: 'WGSL FP32', bundle: 'current', baseline: false, precision: 'fp32' },
-      { label: 'WGSL FP16', bundle: 'current', baseline: false, precision: 'fp16' }
+      { label: 'WGSL FP32 Auto', bundle: 'current', baseline: false, precision: 'fp32' },
+      {
+        label: 'WGSL FP32 Direct',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp32',
+        kernel: 'direct'
+      },
+      {
+        label: 'WGSL FP16 Direct',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp16',
+        kernel: 'direct'
+      },
+      {
+        label: 'WGSL FP16 Implicit GEMM',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp16',
+        kernel: 'implicit-gemm'
+      },
+      {
+        label: 'WGSL FP16 Spatial (experimental)',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp16',
+        kernel: 'spatial'
+      },
+      {
+        label: 'WGSL FP16 Subgroup (experimental)',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp16',
+        kernel: 'subgroup'
+      },
+      {
+        label: 'WebNN FP16 (experimental)',
+        bundle: 'current',
+        baseline: false,
+        precision: 'fp16',
+        engine: 'webnn'
+      }
     ];
     const results = [];
     for (const variant of variants) {

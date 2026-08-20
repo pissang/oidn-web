@@ -16,9 +16,20 @@ import type { HostTensor } from './tza';
 
 export type NativeUNetPrecision = 'fp32' | 'fp16';
 export type NativeUNetPrecisionSetting = NativeUNetPrecision | 'auto';
+export type NativeUNetKernel =
+  | 'direct'
+  | 'implicit-gemm'
+  | 'spatial'
+  | 'subgroup';
+export type NativeUNetKernelSetting = NativeUNetKernel | 'auto';
 
 export interface NativeUNetOptions {
   precision?: NativeUNetPrecisionSetting;
+  /**
+   * Convolution kernel selection. `auto` uses a model-independent capability
+   * heuristic and falls back to the direct kernel when a tile does not fit.
+   */
+  kernel?: NativeUNetKernelSetting;
   /** Maximum number of shape-dependent activation plans retained. */
   shapeCacheSize?: number;
 }
@@ -41,6 +52,7 @@ interface PackedConvBuffers {
 interface NativePipelineSpec {
   key: string;
   code: string;
+  kernel?: NativeUNetKernel;
 }
 
 interface ActivationSlot {
@@ -55,12 +67,29 @@ interface CachedExecution {
   slots: ActivationSlot[];
   nodeBindings: GPUBindGroup[];
   nodePipelines: GPUComputePipeline[];
+  nodeKernels: NativeUNetKernel[];
   inputPipeline: GPUComputePipeline;
   inputUniform: GPUBuffer;
   ownedBuffers: GPUBuffer[];
   cpuInputBuffers?: GPUBuffer[];
   cpuReadbackBuffer?: GPUBuffer;
   lastUsed: number;
+}
+
+interface SharedPipelineCache {
+  ready: Map<string, GPUComputePipeline>;
+  pending: Map<string, Promise<GPUComputePipeline>>;
+}
+
+const pipelineCachesByDevice = new WeakMap<GPUDevice, SharedPipelineCache>();
+
+function sharedPipelineCache(device: GPUDevice) {
+  let cache = pipelineCachesByDevice.get(device);
+  if (!cache) {
+    cache = { ready: new Map(), pending: new Map() };
+    pipelineCachesByDevice.set(device, cache);
+  }
+  return cache;
 }
 
 const WORKGROUP_SIZE = 8;
@@ -70,6 +99,8 @@ const TILED_CONV_M =
   TILED_CONV_WORKGROUP * TILED_CONV_ROWS_PER_THREAD;
 const TILED_CONV_N_BLOCKS = TILED_CONV_WORKGROUP;
 const TILED_CONV_K_BLOCKS = 8;
+const SPATIAL_CONV_WORKGROUP = 8;
+const SPATIAL_CONV_PATCH = SPATIAL_CONV_WORKGROUP + 2;
 
 function roundUp(value: number, alignment: number) {
   return Math.ceil(value / alignment) * alignment;
@@ -317,6 +348,30 @@ acc += vec4<f32>(partial);
 `;
 }
 
+function subgroupAccumulationCode(
+  inputExpression: string,
+  weightBase: string,
+  precision: NativeUNetPrecision
+) {
+  const inputType = precision === 'fp16' ? 'vec4<f16>' : 'vec4<f32>';
+  const accumulator = precision === 'fp16'
+    ? `var partial = vec4<f16>(0.0h);
+partial = fma(subgroupBroadcast(weights[weightBase], 0u), ${inputType}(inputValue.x), partial);
+partial = fma(subgroupBroadcast(weights[weightBase + 1u], 0u), ${inputType}(inputValue.y), partial);
+partial = fma(subgroupBroadcast(weights[weightBase + 2u], 0u), ${inputType}(inputValue.z), partial);
+partial = fma(subgroupBroadcast(weights[weightBase + 3u], 0u), ${inputType}(inputValue.w), partial);
+acc += vec4<f32>(partial);`
+    : `acc = fma(subgroupBroadcast(weights[weightBase], 0u), vec4<f32>(inputValue.x), acc);
+acc = fma(subgroupBroadcast(weights[weightBase + 1u], 0u), vec4<f32>(inputValue.y), acc);
+acc = fma(subgroupBroadcast(weights[weightBase + 2u], 0u), vec4<f32>(inputValue.z), acc);
+acc = fma(subgroupBroadcast(weights[weightBase + 3u], 0u), vec4<f32>(inputValue.w), acc);`;
+  return /* wgsl */ `
+let inputValue = ${inputType}(${inputExpression});
+let weightBase = ${weightBase};
+${accumulator}
+`;
+}
+
 function tiledAccumulationCode(precision: NativeUNetPrecision) {
   if (precision === 'fp16') {
     return /* wgsl */ `
@@ -417,6 +472,7 @@ struct Params {
   inputBlocks: u32,
   outputBlocks: u32,
 }
+
 @group(0) @binding(0) var<storage, read> inputData: array<${inputType}>;
 @group(0) @binding(1) var<storage, read> weights: array<${weightType}>;
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
@@ -446,6 +502,179 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
   let outputIndex = (gid.y * params.outputWidth + gid.x) * ${outputBlocks}u + gid.z;
+  outputData[outputIndex] = ${stored};
+}
+`;
+}
+
+/** Direct convolution with subgroup-wide weight broadcast. */
+function createSubgroupConvShader(
+  precision: NativeUNetPrecision,
+  outputPrecision: NativeUNetPrecision,
+  activation: Conv2DNodeSpec['activation'],
+  inputBlocks: number,
+  outputBlocks: number
+) {
+  const inputType = storageVecType(precision);
+  const weightType = storageVecType(precision);
+  const outputType = storageVecType(outputPrecision);
+  const stored = storeExpression(
+    activationExpression('acc', activation),
+    outputPrecision
+  );
+  return /* wgsl */ `${shaderPreamble(precision)}
+enable subgroups;
+struct Params {
+  inputWidth: u32,
+  inputHeight: u32,
+  outputWidth: u32,
+  outputHeight: u32,
+  inputBlocks: u32,
+  outputBlocks: u32,
+}
+@group(0) @binding(0) var<storage, read> inputData: array<${inputType}>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightType}>;
+@group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> outputData: array<${outputType}>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+@compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE}, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let outputInBounds =
+    gid.x < params.outputWidth && gid.y < params.outputHeight;
+  var acc = bias[gid.z];
+  for (var ky = 0u; ky < 3u; ky++) {
+    let inputY = i32(gid.y) + i32(ky) - 1;
+    let clampedY = u32(clamp(inputY, 0, i32(params.inputHeight) - 1));
+    for (var kx = 0u; kx < 3u; kx++) {
+      let inputX = i32(gid.x) + i32(kx) - 1;
+      let clampedX = u32(clamp(inputX, 0, i32(params.inputWidth) - 1));
+      let inputInBounds =
+        outputInBounds && inputX >= 0 && inputY >= 0 &&
+        inputX < i32(params.inputWidth) && inputY < i32(params.inputHeight);
+      let pixelBase =
+        (clampedY * params.inputWidth + clampedX) * ${inputBlocks}u;
+      for (var inputBlock = 0u; inputBlock < ${inputBlocks}u; inputBlock++) {
+        ${subgroupAccumulationCode(
+          `select(${inputType}(0.0), inputData[pixelBase + inputBlock], inputInBounds)`,
+          `((((gid.z * 3u + ky) * 3u + kx) * ${inputBlocks}u + inputBlock) * 4u)`,
+          precision
+        )}
+      }
+    }
+  }
+  if (outputInBounds) {
+    let outputIndex =
+      (gid.y * params.outputWidth + gid.x) * ${outputBlocks}u + gid.z;
+    outputData[outputIndex] = ${stored};
+  }
+}
+`;
+}
+
+/**
+ * A 2D convolution tile which loads the complete 3x3 halo into workgroup
+ * memory once. Kernel choice only depends on the operation shape, precision,
+ * and device limits; it is deliberately independent of OIDN model names.
+ */
+function createSpatialConvShader(
+  precision: NativeUNetPrecision,
+  outputPrecision: NativeUNetPrecision,
+  activation: Conv2DNodeSpec['activation'],
+  inputBlocks: number,
+  outputBlocks: number
+) {
+  const inputType = storageVecType(precision);
+  const outputType = storageVecType(outputPrecision);
+  const stored = storeExpression(
+    activationExpression('acc', activation),
+    outputPrecision
+  );
+  const patchValues =
+    SPATIAL_CONV_PATCH * SPATIAL_CONV_PATCH * inputBlocks;
+  const workgroupThreads =
+    SPATIAL_CONV_WORKGROUP * SPATIAL_CONV_WORKGROUP;
+
+  return /* wgsl */ `${shaderPreamble(precision)}
+struct Params {
+  inputWidth: u32,
+  inputHeight: u32,
+  outputWidth: u32,
+  outputHeight: u32,
+  inputBlocks: u32,
+  outputBlocks: u32,
+}
+@group(0) @binding(0) var<storage, read> inputData: array<${inputType}>;
+@group(0) @binding(1) var<storage, read> weights: array<${inputType}>;
+@group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> outputData: array<${outputType}>;
+@group(0) @binding(4) var<uniform> params: Params;
+
+var<workgroup> inputPatch: array<${inputType}, ${patchValues}>;
+
+@compute @workgroup_size(${SPATIAL_CONV_WORKGROUP}, ${SPATIAL_CONV_WORKGROUP}, 1)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>
+) {
+  let localLinear =
+    localId.y * ${SPATIAL_CONV_WORKGROUP}u + localId.x;
+  for (
+    var loadIndex = localLinear;
+    loadIndex < ${patchValues}u;
+    loadIndex += ${workgroupThreads}u
+  ) {
+    let patchPixel = loadIndex / ${inputBlocks}u;
+    let inputBlock = loadIndex % ${inputBlocks}u;
+    let patchX = patchPixel % ${SPATIAL_CONV_PATCH}u;
+    let patchY = patchPixel / ${SPATIAL_CONV_PATCH}u;
+    let inputX =
+      i32(workgroupId.x * ${SPATIAL_CONV_WORKGROUP}u + patchX) - 1;
+    let inputY =
+      i32(workgroupId.y * ${SPATIAL_CONV_WORKGROUP}u + patchY) - 1;
+    var value = ${inputType}(0.0);
+    if (
+      inputX >= 0 && inputX < i32(params.inputWidth) &&
+      inputY >= 0 && inputY < i32(params.inputHeight)
+    ) {
+      let inputIndex =
+        (u32(inputY) * params.inputWidth + u32(inputX)) *
+        ${inputBlocks}u + inputBlock;
+      value = inputData[inputIndex];
+    }
+    inputPatch[loadIndex] = value;
+  }
+  workgroupBarrier();
+
+  let outputX =
+    workgroupId.x * ${SPATIAL_CONV_WORKGROUP}u + localId.x;
+  let outputY =
+    workgroupId.y * ${SPATIAL_CONV_WORKGROUP}u + localId.y;
+  let outputBlock = workgroupId.z;
+  if (
+    outputX >= params.outputWidth || outputY >= params.outputHeight ||
+    outputBlock >= ${outputBlocks}u
+  ) {
+    return;
+  }
+
+  var acc = bias[outputBlock];
+  for (var ky = 0u; ky < 3u; ky++) {
+    for (var kx = 0u; kx < 3u; kx++) {
+      let patchBase =
+        ((localId.y + ky) * ${SPATIAL_CONV_PATCH}u + localId.x + kx) *
+        ${inputBlocks}u;
+      for (var inputBlock = 0u; inputBlock < ${inputBlocks}u; inputBlock++) {
+        ${accumulationCode(
+          'inputPatch[patchBase + inputBlock]',
+          `((((outputBlock * 3u + ky) * 3u + kx) * ${inputBlocks}u + inputBlock) * 4u)`,
+          precision
+        )}
+      }
+    }
+  }
+  let outputIndex =
+    (outputY * params.outputWidth + outputX) * ${outputBlocks}u + outputBlock;
   outputData[outputIndex] = ${stored};
 }
 `;
@@ -927,6 +1156,125 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 }
 
+function createSpatialDecoderShader(
+  precision: NativeUNetPrecision,
+  activation: Conv2DNodeSpec['activation'],
+  sourceBlocks: readonly [number, number],
+  upsampledSource: 0 | 1,
+  outputBlocks: number
+) {
+  const valueType = storageVecType(precision);
+  const inputBlocks = sourceBlocks[0] + sourceBlocks[1];
+  const patchValues =
+    SPATIAL_CONV_PATCH * SPATIAL_CONV_PATCH * inputBlocks;
+  const workgroupThreads =
+    SPATIAL_CONV_WORKGROUP * SPATIAL_CONV_WORKGROUP;
+  const stored = storeExpression(
+    activationExpression('acc', activation),
+    precision
+  );
+  const sourceRead = (source: 0 | 1, blockExpression: string) => {
+    const sourceX =
+      source === upsampledSource ? 'u32(inputX) / 2u' : 'u32(inputX)';
+    const sourceY =
+      source === upsampledSource ? 'u32(inputY) / 2u' : 'u32(inputY)';
+    return /* wgsl */ `
+      let sourceBlock = ${blockExpression};
+      let sourceIndex =
+        (${sourceY} * params.source${source}Width + ${sourceX}) *
+        ${sourceBlocks[source]}u + sourceBlock;
+      value = input${source}[sourceIndex];`;
+  };
+
+  return /* wgsl */ `${shaderPreamble(precision)}
+struct Params {
+  outputWidth: u32,
+  outputHeight: u32,
+  outputBlocks: u32,
+  inputBlocks: u32,
+  source0Width: u32,
+  source0Height: u32,
+  source1Width: u32,
+  source1Height: u32,
+}
+@group(0) @binding(0) var<storage, read> input0: array<${valueType}>;
+@group(0) @binding(1) var<storage, read> input1: array<${valueType}>;
+@group(0) @binding(2) var<storage, read> weights: array<${valueType}>;
+@group(0) @binding(3) var<storage, read> bias: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> outputData: array<${valueType}>;
+@group(0) @binding(5) var<uniform> params: Params;
+
+var<workgroup> inputPatch: array<${valueType}, ${patchValues}>;
+
+@compute @workgroup_size(${SPATIAL_CONV_WORKGROUP}, ${SPATIAL_CONV_WORKGROUP}, 1)
+fn main(
+  @builtin(local_invocation_id) localId: vec3<u32>,
+  @builtin(workgroup_id) workgroupId: vec3<u32>
+) {
+  let localLinear =
+    localId.y * ${SPATIAL_CONV_WORKGROUP}u + localId.x;
+  for (
+    var loadIndex = localLinear;
+    loadIndex < ${patchValues}u;
+    loadIndex += ${workgroupThreads}u
+  ) {
+    let patchPixel = loadIndex / ${inputBlocks}u;
+    let inputBlock = loadIndex % ${inputBlocks}u;
+    let patchX = patchPixel % ${SPATIAL_CONV_PATCH}u;
+    let patchY = patchPixel / ${SPATIAL_CONV_PATCH}u;
+    let inputX =
+      i32(workgroupId.x * ${SPATIAL_CONV_WORKGROUP}u + patchX) - 1;
+    let inputY =
+      i32(workgroupId.y * ${SPATIAL_CONV_WORKGROUP}u + patchY) - 1;
+    var value = ${valueType}(0.0);
+    if (
+      inputX >= 0 && inputX < i32(params.outputWidth) &&
+      inputY >= 0 && inputY < i32(params.outputHeight)
+    ) {
+      if (inputBlock < ${sourceBlocks[0]}u) {
+        ${sourceRead(0, 'inputBlock')}
+      } else {
+        ${sourceRead(1, `inputBlock - ${sourceBlocks[0]}u`)}
+      }
+    }
+    inputPatch[loadIndex] = value;
+  }
+  workgroupBarrier();
+
+  let outputX =
+    workgroupId.x * ${SPATIAL_CONV_WORKGROUP}u + localId.x;
+  let outputY =
+    workgroupId.y * ${SPATIAL_CONV_WORKGROUP}u + localId.y;
+  let outputBlock = workgroupId.z;
+  if (
+    outputX >= params.outputWidth || outputY >= params.outputHeight ||
+    outputBlock >= ${outputBlocks}u
+  ) {
+    return;
+  }
+
+  var acc = bias[outputBlock];
+  for (var ky = 0u; ky < 3u; ky++) {
+    for (var kx = 0u; kx < 3u; kx++) {
+      let patchBase =
+        ((localId.y + ky) * ${SPATIAL_CONV_PATCH}u + localId.x + kx) *
+        ${inputBlocks}u;
+      for (var inputBlock = 0u; inputBlock < ${inputBlocks}u; inputBlock++) {
+        ${accumulationCode(
+          'inputPatch[patchBase + inputBlock]',
+          `((((outputBlock * 3u + ky) * 3u + kx) * ${inputBlocks}u + inputBlock) * 4u)`,
+          precision
+        )}
+      }
+    }
+  }
+  let outputIndex =
+    (outputY * params.outputWidth + outputX) * ${outputBlocks}u + outputBlock;
+  outputData[outputIndex] = ${stored};
+}
+`;
+}
+
 function createInputPackShader(
   precision: NativeUNetPrecision,
   sourceCount: number
@@ -1002,14 +1350,14 @@ export function resolveNativeUNetPrecision(
 /** Native, model-driven OIDN U-Net executor. */
 export class NativeUNetExecutor {
   readonly precision: NativeUNetPrecision;
+  readonly kernelSetting: NativeUNetKernelSetting;
+  readonly maxSpatialInputBlocks: number;
+  readonly subgroupsAvailable: boolean;
 
   private _model: UNetModelGraph;
   private _packedConvs = new Map<string, PackedConvBuffers>();
-  private _pipelineCache = new Map<string, GPUComputePipeline>();
-  private _pipelinePromises = new Map<
-    string,
-    Promise<GPUComputePipeline>
-  >();
+  private _pipelineCache: Map<string, GPUComputePipeline>;
+  private _pipelinePromises: Map<string, Promise<GPUComputePipeline>>;
   private _executionCache = new Map<string, CachedExecution>();
   private _clock = 0;
   private _shapeCacheSize: number;
@@ -1021,10 +1369,28 @@ export class NativeUNetExecutor {
     model: ValidatedUNetModel,
     options: NativeUNetOptions = {}
   ) {
+    const pipelineCache = sharedPipelineCache(_device);
+    this._pipelineCache = pipelineCache.ready;
+    this._pipelinePromises = pipelineCache.pending;
     this.precision = resolveNativeUNetPrecision(
       _device,
       options.precision ?? 'auto'
     );
+    this.kernelSetting = options.kernel ?? 'auto';
+    this.subgroupsAvailable = _device.features.has(
+      'subgroups' as GPUFeatureName
+    );
+    this.maxSpatialInputBlocks =
+      this.precision === 'fp16' &&
+      _device.limits.maxComputeInvocationsPerWorkgroup >=
+        SPATIAL_CONV_WORKGROUP * SPATIAL_CONV_WORKGROUP &&
+      _device.limits.maxComputeWorkgroupSizeX >= SPATIAL_CONV_WORKGROUP &&
+      _device.limits.maxComputeWorkgroupSizeY >= SPATIAL_CONV_WORKGROUP
+        ? Math.floor(
+            _device.limits.maxComputeWorkgroupStorageSize /
+              (SPATIAL_CONV_PATCH * SPATIAL_CONV_PATCH * 4 * 2)
+          )
+        : 0;
     this._shapeCacheSize = Math.max(1, options.shapeCacheSize ?? 2);
 
     if (
@@ -1118,20 +1484,21 @@ export class NativeUNetExecutor {
   ): NativePipelineSpec {
     if (node.op === 'conv2d') {
       const outputPrecision = isFinal ? 'fp32' : this.precision;
-      const tiled = this.precision === 'fp32' && !isFinal;
       const inputBlocks = blocksForChannels(
         this._model.convChannels.get(node.id)!.inputChannels
       );
       const outputBlocks = blocksForChannels(
         this._model.convChannels.get(node.id)!.outputChannels
       );
+      const kernel = this._selectConvKernel(inputBlocks, isFinal);
       const key =
-        `${tiled ? 'conv-tiled' : 'conv'}/${this.precision}/` +
+        `conv-${kernel}/${this.precision}/` +
         `${outputPrecision}/${node.activation}/` +
         `in${inputBlocks}/out${outputBlocks}`;
       return {
         key,
-        code: tiled
+        kernel,
+        code: kernel === 'implicit-gemm'
           ? createTiledConvShader(
               this.precision,
               outputPrecision,
@@ -1139,13 +1506,29 @@ export class NativeUNetExecutor {
               inputBlocks,
               outputBlocks
             )
-          : createConvShader(
-              this.precision,
-              outputPrecision,
-              node.activation,
-              inputBlocks,
-              outputBlocks
-            )
+          : kernel === 'spatial'
+            ? createSpatialConvShader(
+                this.precision,
+                outputPrecision,
+                node.activation,
+                inputBlocks,
+                outputBlocks
+              )
+            : kernel === 'subgroup'
+              ? createSubgroupConvShader(
+                  this.precision,
+                  outputPrecision,
+                  node.activation,
+                  inputBlocks,
+                  outputBlocks
+                )
+              : createConvShader(
+                  this.precision,
+                  outputPrecision,
+                  node.activation,
+                  inputBlocks,
+                  outputBlocks
+                )
       };
     }
     if (node.op === 'maxPool2d') {
@@ -1155,6 +1538,7 @@ export class NativeUNetExecutor {
       const key = `max-pool/${this.precision}/out${outputBlocks}`;
       return {
         key,
+        kernel: 'direct',
         code: createMaxPoolShader(this.precision, outputBlocks)
       };
     }
@@ -1170,6 +1554,7 @@ export class NativeUNetExecutor {
         `in${inputBlocks}/out${outputBlocks}`;
       return {
         key,
+        kernel: 'direct',
         code: createFusedConvPoolShader(
           this.precision,
           node.conv.activation,
@@ -1189,17 +1574,24 @@ export class NativeUNetExecutor {
       if (upsampledSource !== 0 && upsampledSource !== 1) {
         throw new Error(`Native fused decoder ${node.id} has no upsample input`);
       }
-      const tiled = this.precision === 'fp32';
+      const inputBlocks = sourceBlocks[0] + sourceBlocks[1];
+      const selectedKernel = this._selectConvKernel(inputBlocks, false);
+      // The subgroup broadcast path currently targets the common standalone
+      // convolution layout; fused decoder reads use the direct kernel.
+      const kernel = selectedKernel === 'subgroup'
+        ? 'direct'
+        : selectedKernel;
       const outputBlocks = blocksForChannels(
         this._model.convChannels.get(node.conv.id)!.outputChannels
       );
       const key =
-        `${tiled ? 'decoder-tiled' : 'decoder'}/${this.precision}/` +
+        `decoder-${kernel}/${this.precision}/` +
         `${node.conv.activation}/` +
         `${sourceBlocks.join('+')}/out${outputBlocks}/up${upsampledSource}`;
       return {
         key,
-        code: tiled
+        kernel,
+        code: kernel === 'implicit-gemm'
           ? createTiledDecoderShader(
               this.precision,
               node.conv.activation,
@@ -1207,7 +1599,15 @@ export class NativeUNetExecutor {
               upsampledSource,
               outputBlocks
             )
-          : createFusedDecoderShader(
+          : kernel === 'spatial'
+            ? createSpatialDecoderShader(
+                this.precision,
+                node.conv.activation,
+                sourceBlocks,
+                upsampledSource,
+                outputBlocks
+              )
+            : createFusedDecoderShader(
               this.precision,
               node.conv.activation,
               sourceBlocks,
@@ -1219,6 +1619,27 @@ export class NativeUNetExecutor {
     throw new Error(
       `Native OIDN does not implement unfused ${node.op} node ${node.id}`
     );
+  }
+
+  private _selectConvKernel(
+    inputBlocks: number,
+    isFinal: boolean
+  ): NativeUNetKernel {
+    const spatialFits =
+      this.precision === 'fp16' &&
+      inputBlocks <= this.maxSpatialInputBlocks;
+    if (this.kernelSetting === 'direct') return 'direct';
+    if (this.kernelSetting === 'spatial') {
+      return spatialFits ? 'spatial' : 'direct';
+    }
+    if (this.kernelSetting === 'implicit-gemm') {
+      return isFinal ? 'direct' : 'implicit-gemm';
+    }
+    if (this.kernelSetting === 'subgroup') {
+      return this.subgroupsAvailable ? 'subgroup' : 'direct';
+    }
+    if (this.precision === 'fp32' && !isFinal) return 'implicit-gemm';
+    return 'direct';
   }
 
   private _nodePipeline(node: ExecutableModelNode, isFinal: boolean) {
@@ -1313,13 +1734,16 @@ export class NativeUNetExecutor {
       createInputPackShader(this.precision, inputSourceCount)
     );
     const nodePipelines: GPUComputePipeline[] = [];
+    const nodeKernels: NativeUNetKernel[] = [];
     const nodeBindings: GPUBindGroup[] = [];
     const ownedBuffers: GPUBuffer[] = [];
 
     plan.plannedNodes.forEach(({ node, outputShape }, index) => {
       const isFinal = node.id === plan.spec.output;
-      const pipeline = this._nodePipeline(node, isFinal);
+      const pipelineSpec = this._nodePipelineSpec(node, isFinal);
+      const pipeline = this._pipeline(pipelineSpec.key, pipelineSpec.code);
       nodePipelines.push(pipeline);
+      nodeKernels.push(pipelineSpec.kernel ?? 'direct');
       const output = valueBuffers.get(node.id)!;
       let entries: GPUBindGroupEntry[];
       let uniformValues: number[];
@@ -1440,6 +1864,7 @@ export class NativeUNetExecutor {
       slots,
       nodeBindings,
       nodePipelines,
+      nodeKernels,
       inputPipeline,
       inputUniform,
       ownedBuffers,
@@ -1570,12 +1995,7 @@ export class NativeUNetExecutor {
       );
       pass.setPipeline(execution.nodePipelines[index]);
       pass.setBindGroup(0, execution.nodeBindings[index]);
-      if (
-        this.precision === 'fp32' &&
-        (node.op === 'fusedUpsampleConcatConv2d' ||
-          (node.op === 'conv2d' &&
-            node.id !== execution.plan.spec.output))
-      ) {
+      if (execution.nodeKernels[index] === 'implicit-gemm') {
         pass.dispatchWorkgroups(
           Math.ceil(
             (outputShape.width * outputShape.height) / TILED_CONV_M
