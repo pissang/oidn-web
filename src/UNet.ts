@@ -1,23 +1,4 @@
-// import * as tfjs from '@tensorflow/tfjs-core';
-import { Tensor, Tensor1D, Tensor4D } from '@tensorflow/tfjs-core';
-import type { SymbolicTensor } from '@tensorflow/tfjs-layers';
-import { tensor } from '@tensorflow/tfjs-core/dist/ops/tensor';
-import { tensor1d } from '@tensorflow/tfjs-core/dist/ops/tensor1d';
-import { mirrorPad } from '@tensorflow/tfjs-core/dist/ops/mirror_pad';
-import { pad4d } from '@tensorflow/tfjs-core/dist/ops/pad4d';
-import { slice4d } from '@tensorflow/tfjs-core/dist/ops/slice4d';
-import { concat4d } from '@tensorflow/tfjs-core/dist/ops/concat_4d';
-import { ENGINE } from '@tensorflow/tfjs-core/dist/engine';
-import {
-  Conv2D,
-  UpSampling2D
-} from '@tensorflow/tfjs-layers/dist/layers/convolutional';
-import { MaxPooling2D } from '@tensorflow/tfjs-layers/dist/layers/pooling';
-import { Concatenate } from '@tensorflow/tfjs-layers/dist/layers/merge';
-import { LayersModel } from '@tensorflow/tfjs-layers/dist/engine/training';
-import { Input as TFInput } from '@tensorflow/tfjs-layers/dist/engine/input_layer';
 import { HostTensor } from './tza';
-import { Float16Array } from '@petamoriken/float16';
 import {
   GPUDataProcess,
   Tile,
@@ -25,43 +6,24 @@ import {
   hdrTransferFuncCPU,
   hdrTransferFuncInverseCPU
 } from './process';
-import type { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
+import {
+  DynamicTileController,
+  type DynamicTileSetting,
+  fitTileDimension,
+  OIDN_TILE_ALIGNMENT,
+  waitForSubmittedGPUWork
+} from './tileScheduler';
+import {
+  detectUNetModelSpec,
+  validateUNetModel,
+  type UNetModelSpec
+} from './modelSpec';
+import {
+  NativeUNetExecutor,
+  type NativeUNetPrecisionSetting
+} from './nativeUNet';
 
-// import { profileAndLogKernelCode, memory } from './helper';
-
-function getTensorData(
-  ubytes: Uint8Array,
-  type: HostTensor['desc']['dataType']
-) {
-  const buffer = ubytes.buffer;
-  if (type === 'Float32') {
-    return new Float32Array(ubytes.buffer);
-  }
-  const float16Data = new Float16Array(buffer);
-  const float32Data = new Float32Array(float16Data.length);
-  for (let i = 0; i < float32Data.length; ++i) {
-    float32Data[i] = float16Data[i];
-  }
-  return float32Data;
-}
-
-function changeWeightShapes(weightData: Float32Array, dims: number[]) {
-  const [O, C, H, W] = dims;
-  const reorderedWeightData = new Float32Array(weightData.length);
-  for (let o = 0; o < O; ++o) {
-    for (let c = 0; c < C; ++c) {
-      for (let h = 0; h < H; ++h) {
-        for (let w = 0; w < W; ++w) {
-          // Change OCHW to HWCO
-          const idx = o * C * H * W + c * H * W + h * W + w;
-          const idx2 = h * W * C * O + w * C * O + c * O + o;
-          reorderedWeightData[idx2] = weightData[idx];
-        }
-      }
-    }
-  }
-  return reorderedWeightData;
-}
+export type UNetEngineSetting = 'auto' | 'wgsl';
 
 interface HDRImageData {
   data: Float32Array;
@@ -84,10 +46,6 @@ interface GPUImageDataOutput {
 function roundUp(a: number, b: number) {
   return Math.ceil(a / b) * b;
 }
-// Returns the smallest integer larger than or equal to a which has remainder c when divided by b
-function roundUp2(a: number, b: number, c: number) {
-  return Math.ceil((a - c) / b) * b + c;
-}
 
 function isGPUImageData(
   data: ImageData | GPUImageData | HDRImageData
@@ -95,18 +53,7 @@ function isGPUImageData(
   return data.data instanceof GPUBuffer || data.data instanceof GPUTexture;
 }
 
-const receptiveField = 174; // receptive field in pixels
-const receptiveFieldLarge = 202;
-// TODO metal is 32?
-const minTileAlignment = 1;
-
-const tileAlignment = 16; // required spatial alignment in pixels (padding may be necessary)
-
-const defaultTileOverlap = roundUp(receptiveField / 2, tileAlignment);
-const defaultTileOverlapLarge = roundUp(receptiveFieldLarge / 2, tileAlignment);
-
 class UNet {
-  private _tfModel: LayersModel | undefined;
   private _device: GPUDevice | undefined;
 
   // TODO calculate the tile size from memory size
@@ -121,15 +68,16 @@ class UNet {
   private _hdr;
 
   private _dataProcessGPU?: GPUDataProcess;
+  private _nativeExecutor: NativeUNetExecutor;
+  private _modelSpec: UNetModelSpec;
+  private _inputChannels: number;
+  private _engine: UNetEngineSetting;
 
-  private _maxTileSize;
-
-  private _tensors = new Map<string, Tensor>();
-  private _modelsCache = new Map<string, LayersModel>();
+  private _dynamicTileController: DynamicTileController;
 
   constructor(
-    private _hostTensors: Map<string, HostTensor>,
-    private _backend: WebGPUBackend,
+    hostTensors: Map<string, HostTensor>,
+    backend: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
     opts: {
       /**
        * If use auxiliary data.
@@ -140,228 +88,76 @@ class UNet {
        */
       hdr?: boolean;
       maxTileSize?: number;
+      dynamicTile?: DynamicTileSetting;
+      /** Reserved for explicit native WGSL selection. */
+      engine?: UNetEngineSetting;
+      /** Arithmetic/storage precision used by the native WGSL engine. */
+      precision?: NativeUNetPrecisionSetting;
+      /** Explicit descriptor for a new OIDN topology not in the built-in registry. */
+      modelSpec?: UNetModelSpec;
     } = {}
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
+    this._engine = opts.engine ?? 'auto';
+    const modelSpec = opts.modelSpec ?? detectUNetModelSpec(hostTensors);
+    const validatedModel = validateUNetModel(hostTensors, modelSpec);
+    this._modelSpec = validatedModel.spec;
+    this._inputChannels = validatedModel.inputChannels;
 
-    this._maxTileSize = roundUp(opts.maxTileSize ?? 512, 2);
+    const expectedInputChannels = this._aux ? 9 : 3;
+    if (validatedModel.inputChannels !== expectedInputChannels) {
+      throw new Error(
+        `OIDN model expects ${validatedModel.inputChannels} input channels, ` +
+          `but aux=${this._aux} provides ${expectedInputChannels}`
+      );
+    }
 
-    this._device = this._backend.device;
+    this._dynamicTileController = new DynamicTileController(
+      opts.maxTileSize ?? 512,
+      opts.dynamicTile
+    );
+
+    this._device = backend.device;
+    this._nativeExecutor = new NativeUNetExecutor(
+      this._device,
+      validatedModel,
+      { precision: opts.precision }
+    );
   }
 
   getDevice() {
     return this._device;
   }
 
-  private _buildModel(isLarge: boolean) {
-    const aux = this._aux;
-    const channels = 3 + (aux ? 6 : 0);
-    const tileSize = this._getTileSizeWithOverlap();
-    const cache = this._modelsCache;
-    const key = [tileSize.width, tileSize.height].join(',');
-
-    // We cache the model instead of disposing and recreate.
-    // Because seems tfjs will also cache the layer and gpubuffers.
-    // Recreating the model will cause memory leak.
-
-    // Width and height can only be 256, 512, 768. So the cache won't be too large
-    if (cache.has(key)) {
-      this._tfModel = cache.get(key);
-      return;
-    }
-
-    const input = TFInput({
-      name: 'input',
-      shape: [tileSize.height, tileSize.width, channels],
-      dtype: 'float32'
-    });
-
-    this._tfModel = new LayersModel({
-      inputs: [input],
-      outputs: isLarge ? this._addNetLarge(input) : this._addNet(input)
-    });
-    cache.set(key, this._tfModel);
-  }
-
-  private _createConv(
-    name: string,
-    source: SymbolicTensor,
-    activation?: 'relu'
-  ) {
-    const weightTensorName = name + '.weight';
-    const biasTensorName = name + '.bias';
-    const tensors = this._tensors;
-    let weightTensor = tensors.get(weightTensorName);
-    let biasTensor = tensors.get(biasTensorName);
-    const unetWeightTensor = this._hostTensors.get(weightTensorName)!;
-
-    if (!weightTensor) {
-      const weightDims = unetWeightTensor.desc.dims;
-      weightTensor = tensor(
-        changeWeightShapes(
-          getTensorData(unetWeightTensor.data, unetWeightTensor.desc.dataType),
-          weightDims
-        ),
-        [weightDims[2], weightDims[3], weightDims[1], weightDims[0]],
-        'float32'
-      );
-
-      tensors.set(weightTensorName, weightTensor);
-    }
-    if (!biasTensor) {
-      const unetBiasTensor = this._hostTensors.get(name + '.bias')!;
-      biasTensor = tensor1d(
-        getTensorData(unetBiasTensor.data, unetBiasTensor.desc.dataType),
-        'float32'
-      );
-      tensors.set(biasTensorName, biasTensor);
-    }
-    // TODO whats the purpose of padded dims ?
-    const convLayer = new Conv2D({
-      name,
-      filters: unetWeightTensor.desc.dims[0],
-      kernelSize: unetWeightTensor.desc.dims.slice(2, 4) as [number, number],
-      useBias: true,
-      activation,
-      padding: 'same',
-      weights: [weightTensor, biasTensor],
-      trainable: false
-    });
-
-    return convLayer.apply(source) as SymbolicTensor;
-  }
-
-  private _createConcatConv(
-    name: string,
-    source1: SymbolicTensor,
-    source2: SymbolicTensor
-  ) {
-    const concatLayer = new Concatenate({
-      name: name + '/concat',
-      trainable: false,
-      axis: 3
-    });
-    //https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L40
-    return this._createConv(
-      name,
-      // Concat on the channel
-      concatLayer.apply([source1, source2]) as SymbolicTensor,
-      'relu'
-    ) as SymbolicTensor;
-  }
-
-  private _createPooling(source: SymbolicTensor) {
-    const poolingLayer = new MaxPooling2D({
-      name: source.name + '/pooling',
-      poolSize: [2, 2],
-      strides: [2, 2],
-      padding: 'same',
-      trainable: false
-    });
-    // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/training/model.py#L33
-    return poolingLayer.apply(source) as SymbolicTensor;
-  }
-
-  private _addUpsamplingLayer(source: SymbolicTensor) {
-    const upsamplingLayer = new UpSampling2D({
-      name: source.name + '/upsampling',
-      size: [2, 2],
-      trainable: false
-    });
-    return upsamplingLayer.apply(source) as SymbolicTensor;
-  }
-
-  private _addNet(input: SymbolicTensor) {
-    let x = this._createConv('enc_conv0', input, 'relu');
-    const pool1 = (x = this._createPooling(
-      this._createConv('enc_conv1', x, 'relu')
-    ));
-    const pool2 = (x = this._createPooling(
-      this._createConv('enc_conv2', x, 'relu')
-    ));
-    const pool3 = (x = this._createPooling(
-      this._createConv('enc_conv3', x, 'relu')
-    ));
-    const pool4 = (x = this._createPooling(
-      this._createConv('enc_conv4', x, 'relu')
-    ));
-    x = this._createConv('enc_conv5a', pool4, 'relu');
-    x = this._addUpsamplingLayer(this._createConv('enc_conv5b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv4a', x, pool3);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv4b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv3a', x, pool2);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv3b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv2a', x, pool1);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv2b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv1a', x, input);
-    x = this._createConv('dec_conv1b', x, 'relu');
-    x = this._createConv('dec_conv0', x, 'relu');
-
-    return x;
-  }
-
-  private _addNetLarge(input: SymbolicTensor) {
-    let x = this._createConv('enc_conv1a', input, 'relu');
-    const pool1 = (x = this._createPooling(
-      this._createConv('enc_conv1b', x, 'relu')
-    ));
-    x = this._createConv('enc_conv2a', x, 'relu');
-    const pool2 = (x = this._createPooling(
-      this._createConv('enc_conv2b', x, 'relu')
-    ));
-    x = this._createConv('enc_conv3a', x, 'relu');
-    const pool3 = (x = this._createPooling(
-      this._createConv('enc_conv3b', x, 'relu')
-    ));
-    x = this._createConv('enc_conv4a', x, 'relu');
-    const pool4 = (x = this._createPooling(
-      this._createConv('enc_conv4b', x, 'relu')
-    ));
-
-    x = this._createConv('enc_conv5a', pool4, 'relu');
-    x = this._addUpsamplingLayer(this._createConv('enc_conv5b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv4a', x, pool3);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv4b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv3a', x, pool2);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv3b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv2a', x, pool1);
-    x = this._addUpsamplingLayer(this._createConv('dec_conv2b', x, 'relu'));
-
-    x = this._createConcatConv('dec_conv1a', x, input);
-    x = this._createConv('dec_conv1b', x, 'relu');
-    x = this._createConv('dec_conv1c', x, 'relu');
-
-    return x;
+  getRuntimeInfo() {
+    return {
+      configuredEngine: this._engine,
+      gpuEngine: 'wgsl' as const,
+      precision: this._nativeExecutor.precision,
+      model: this._modelSpec.id,
+      modelFamily: this._modelSpec.family,
+      inputChannels: this._inputChannels
+    };
   }
 
   private _updateModel(width: number, height: number) {
-    const isLarge = this._hostTensors.has('enc_conv1b.weight');
-    const maxTileSize = this._maxTileSize;
+    const maxTileSize = this._dynamicTileController.tileSize;
 
-    let tileWidth = maxTileSize;
-    let tileHeight = maxTileSize;
-    let tileOverlapX = isLarge ? defaultTileOverlapLarge : defaultTileOverlap;
-    let tileOverlapY = isLarge ? defaultTileOverlapLarge : defaultTileOverlap;
+    let tileWidth = fitTileDimension(width, maxTileSize);
+    let tileHeight = fitTileDimension(height, maxTileSize);
+    const defaultTileOverlap = roundUp(
+      this._modelSpec.receptiveField / 2,
+      OIDN_TILE_ALIGNMENT
+    );
+    let tileOverlapX = defaultTileOverlap;
+    let tileOverlapY = defaultTileOverlap;
 
-    if (width < maxTileSize + defaultTileOverlap * 2) {
-      tileWidth = roundUp(width, maxTileSize / 2);
-      if (width <= maxTileSize) {
-        tileOverlapX = 0;
-      }
+    if (width <= maxTileSize) {
+      tileOverlapX = 0;
     }
-    if (height < maxTileSize + defaultTileOverlap * 2) {
-      tileHeight = roundUp(height, maxTileSize / 2);
-      if (height <= maxTileSize) {
-        tileOverlapY = 0;
-      }
+    if (height <= maxTileSize) {
+      tileOverlapY = 0;
     }
 
     // Force width and height has same size. reduce the cache in memory
@@ -376,16 +172,13 @@ class UNet {
       tileWidth !== this._tileWidth ||
       tileHeight !== this._tileHeight ||
       tileOverlapX !== this._tileOverlapX ||
-      tileOverlapY !== this._tileOverlapY ||
-      !this._tfModel
+      tileOverlapY !== this._tileOverlapY
     ) {
       // console.log(tileWidth, tileHeight, tileOverlapX, tileOverlapY);
       this._tileWidth = tileWidth;
       this._tileHeight = tileHeight;
       this._tileOverlapX = tileOverlapX;
       this._tileOverlapY = tileOverlapY;
-
-      this._buildModel(isLarge);
     }
   }
 
@@ -497,7 +290,7 @@ class UNet {
     }
   }
 
-  private _executeTile(
+  private async _executeTile(
     inputData:
       | Float32Array
       | {
@@ -534,7 +327,8 @@ class UNet {
 
     const srcTile = new Tile(srcX0, srcY0, srcTileWidth, srcTileHeight);
 
-    let tileTensor!: Tensor;
+    let nativeOutputBuffer: GPUBuffer | undefined;
+    let denoisedData: Float32Array | undefined;
     let inputScale = 1;
     const device = this._device!;
     let dataProcessGPU = this._dataProcessGPU;
@@ -552,11 +346,11 @@ class UNet {
           inputScale
         });
       }
-      tileTensor = tensor(
+      denoisedData = await this._nativeExecutor.executeCPU(
         tileData,
-        [1, srcTileHeight, srcTileWidth, channels],
-        'float32'
-      ) as Tensor4D;
+        srcTileWidth,
+        srcTileHeight
+      );
     } else {
       if (!dataProcessGPU) {
         dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(
@@ -577,33 +371,14 @@ class UNet {
         denoiseAlpha
       );
 
-      const createTensor = (buffer: GPUBuffer) => {
-        const tmp = tensor({ buffer, zeroCopy: true }, [
-          1,
-          srcTileHeight,
-          srcTileWidth,
-          4
-        ]) as Tensor4D;
-        const ret = slice4d(
-          tmp,
-          [0, 0, 0, 0],
-          [1, srcTileHeight, srcTileWidth, 3]
-        );
-        return ret;
-      };
-
-      if (this._aux) {
-        const tensors = [color, albedo, normal].map((buffer) =>
-          createTensor(buffer!)
-        );
-        tileTensor = concat4d(tensors, 3);
-      } else {
-        tileTensor = createTensor(color);
-      }
+      nativeOutputBuffer = this._nativeExecutor.execute(
+        this._aux ? [color, albedo!, normal!] : [color],
+        srcTileWidth,
+        srcTileHeight
+      );
     }
 
     let outBuffer: GPUBuffer;
-    const outputTensor = this._tfModel!.predict(tileTensor) as Tensor;
 
     const dstWidth = Math.min(dstTileSize.width, width);
     const dstHeight = Math.min(dstTileSize.height, height);
@@ -612,10 +387,9 @@ class UNet {
     dstTile.height = Math.min(dstTile.height, height - dstTile.y);
 
     if (inputData instanceof Float32Array) {
-      let denoisedData = outputTensor.dataSync();
       if (isHDR) {
         denoisedData = hdrTransferFuncInverseCPU({
-          data: denoisedData as Float32Array,
+          data: denoisedData!,
           channels: 3,
           inputScale
         });
@@ -625,7 +399,7 @@ class UNet {
         outputImageData!,
         srcTile,
         dstTile,
-        denoisedData as Float32Array,
+        denoisedData!,
         srcTileSize.width,
         isHDR
       );
@@ -641,17 +415,8 @@ class UNet {
       }
     } else {
       dataProcessGPU!.setOutputTile(dstTile, srcTile);
-      // IMPORTANT
-      // storage buffer has alignment. that 3 channels still needs 16 bytes data.
-      // So we need to pad it to 4 channels.
-      const outputTensor4Channnels = pad4d(outputTensor as Tensor4D, [
-        [0, 0],
-        [0, 0],
-        [0, 0],
-        [0, 1]
-      ]);
       outBuffer = dataProcessGPU!.inverse(
-        outputTensor4Channnels.dataToGPU().buffer!,
+        nativeOutputBuffer!,
         inputData.color
       );
     }
@@ -694,6 +459,9 @@ class UNet {
 
     const width = color.width;
     const height = color.height;
+    const adaptiveTileSize = this._dynamicTileController.tileSize;
+    const shouldAdaptTileSize =
+      width > adaptiveTileSize || height > adaptiveTileSize;
     this._updateModel(width, height);
 
     // TODO should fixed to be hdr when UNet is created.
@@ -733,14 +501,23 @@ class UNet {
 
     let aborted = false;
 
-    const executeTile = (i: number, j: number) => {
+    const tileTimesMs: number[] = [];
+    const now = () =>
+      typeof performance === 'undefined' ? Date.now() : performance.now();
+    const scheduleNextTile = (callback: () => void) => {
+      if (typeof requestAnimationFrame === 'undefined') {
+        setTimeout(callback, 0);
+      } else {
+        requestAnimationFrame(callback);
+      }
+    };
+
+    const executeTile = async (i: number, j: number) => {
       if (aborted) {
         return;
       }
-      let resGPUBuffer;
-      // profileAndLogKernelCode(() => {
-      ENGINE.startScope();
-      resGPUBuffer = this._executeTile(
+      const tileStartTime = now();
+      const resGPUBuffer = await this._executeTile(
         isGPUImageData(color)
           ? {
               color: color.data,
@@ -757,8 +534,7 @@ class UNet {
         hdr,
         denoiseAlpha
       );
-      ENGINE.endScope();
-      // }, true);
+      if (aborted) return;
       const output = outputImageData || {
         data: resGPUBuffer,
         width,
@@ -773,18 +549,37 @@ class UNet {
         tileCountW * tileCountH
       );
 
-      if (i + 1 < tileCountW || j + 1 < tileCountH) {
-        requestAnimationFrame(() => {
-          if (i + 1 < tileCountW) {
-            executeTile(i + 1, j);
-          } else if (j + 1 < tileCountH) {
-            executeTile(0, j + 1);
+      const hasNextTile = i + 1 < tileCountW || j + 1 < tileCountH;
+      const continueAfterGPUWork = () => {
+        tileTimesMs.push(now() - tileStartTime);
+        if (aborted) return;
+
+        if (hasNextTile) {
+          scheduleNextTile(() => {
+            if (aborted) return;
+            if (i + 1 < tileCountW) {
+              executeTile(i + 1, j);
+            } else if (j + 1 < tileCountH) {
+              executeTile(0, j + 1);
+            }
+          });
+        } else {
+          // Adapt only from complete executions. Cancelled work is commonly
+          // contending with interactive rendering and is not representative.
+          if (shouldAdaptTileSize) {
+            this._dynamicTileController.observe(tileTimesMs);
           }
-        });
-      } else {
-        // console.log(memory());
-        done(output as any);
-      }
+          // console.log(memory());
+          done(output as any);
+        }
+      };
+
+      // requestAnimationFrame only throttles JavaScript submission. Waiting
+      // for the queue here keeps at most one OIDN tile in flight, so aborting
+      // cannot leave a long tail of already-submitted GPU work.
+      void waitForSubmittedGPUWork(this._device!.queue).then(
+        continueAfterGPUWork
+      );
     };
 
     executeTile(0, 0);
@@ -795,9 +590,8 @@ class UNet {
   }
 
   dispose() {
-    this._tfModel?.dispose();
     this._dataProcessGPU?.dispose();
-    this._tensors.forEach((tensor) => tensor.dispose());
+    this._nativeExecutor.dispose();
   }
 }
 

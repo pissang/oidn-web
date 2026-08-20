@@ -9,9 +9,17 @@ It's used in the [Vector to 3D](https://www.figma.com/community/plugin/126460021
 | :----------------------------------------------------------------------------------------------: | :--------------------------------------------------------------------------------: | :--------------------------------------------------------------------------------------: |
 | ![](https://github.com/pissang/oidn-web/blob/main/examples/test/ground-truth.png 'Ground Truth') | ![](https://github.com/pissang/oidn-web/blob/main/examples/test/noisy.png 'Noisy') | ![](https://github.com/pissang/oidn-web/blob/main/examples/test/denoised.png 'Denoised') |
 
-## How it Works.
+## How it works
 
-It uses [tfjs](https://github.com/tensorflow/tfjs) to build the UNet model used by the OIDN. Then use the model to do prediction with a WebGPU backend from the image data.
+The OIDN U-Net runs directly on WebGPU with model-driven WGSL compute
+pipelines. TensorFlow.js is not used. Convolution activations use a blocked
+four-channel layout, encoder `conv + ReLU + max-pool` and decoder
+`upsample + concat + conv` patterns are fused, and all network dispatches for a
+tile are submitted in one command buffer.
+
+TZA half-float weights stay half-float when the device enables `shader-f16`.
+Convolution accumulates in FP32 and the final output is FP32. Devices without
+`shader-f16` automatically use the native FP32 path.
 
 ## How to Use
 
@@ -42,7 +50,7 @@ initUNetFromURL('./weights/rt_ldr.tza').then((unet) => {
   const abortDenoising = unet.tileExecute({
     // The color input for LDR image is 4 channels.
     // In the format of Uint8ClampedArray or Uint8Array.
-    color: { data: noisyImageData, width, height },
+    color: noisyImageData,
     done(denoised) {
       console.log('Finished');
     },
@@ -111,7 +119,7 @@ If you already have a WebGPU path tracer. You can integrate the oidn-web into yo
 initUNetFromURL(
   './weights/rt_hdr_alb_nrm.tza',
   {
-    // Share GPUDevice and GPUAdapterInfo to the TFJS WebGPU backend
+    // Share GPUDevice and GPUAdapterInfo with the native WGSL runtime.
     device,
     adapterInfo
   },
@@ -152,6 +160,91 @@ initUNetFromURL('./weights/rt_hdr_alb_nrm_small.tza', ...);
 ```
 
 Other combinations can be found in the [oidn-weights](https://github.com/RenderKit/oidn-weights)
+
+### FP16 and runtime information
+
+Standalone initialization requests `shader-f16` when the adapter supports it.
+When sharing a device, optional features must be requested when that device is
+created; WebGPU features cannot be enabled afterward.
+
+```ts
+const requiredFeatures = adapter.features.has('shader-f16')
+  ? ['shader-f16']
+  : [];
+const device = await adapter.requestDevice({ requiredFeatures });
+
+const unet = await initUNetFromURL(modelUrl, { device, adapterInfo }, {
+  aux: true,
+  hdr: true,
+  precision: 'auto' // 'fp16' enforces support; 'fp32' is deterministic fallback
+});
+
+console.log(unet.getRuntimeInfo());
+// { gpuEngine: 'wgsl', precision: 'fp16', model: 'oidn-unet-large-v1', ... }
+```
+
+### Updating to a new OIDN model
+
+TZA stores tensors but not the executable graph. The runtime therefore keeps
+the graph in a versioned `UNetModelSpec`, separate from shader and precision
+code. Built-in descriptors cover the current OIDN small and large RT U-Nets.
+At load time the descriptor is detected from the complete tensor-name set, and
+tensor layout, dtype, byte length, kernel shape, bias shape, and graph channel
+flow are validated before GPU resources are created.
+
+If an OIDN update keeps one of these topologies and tensor names, changed
+channel widths are handled automatically. If it adds or renames nodes, add a
+new descriptor (or pass `modelSpec`) and its validation fixture. Existing graph
+fusion rules apply to the new descriptor without changes to WGSL kernels.
+
+Use the inspection command to get a stable SHA-256, full tensor signature, and
+descriptor compatibility result for an upstream weight file:
+
+```shell
+npm run model:inspect -- weights/rt_hdr_alb_nrm.tza
+```
+
+```ts
+const unet = await initUNetFromURL(newModelUrl, backend, {
+  aux: true,
+  hdr: true,
+  modelSpec: newOidnModelSpec
+});
+```
+
+### GPU backpressure and dynamic tiles
+
+`tileExecute` waits for the submitted GPU work of a tile before scheduling the
+next tile. This keeps at most one OIDN tile in flight, which makes cancellation
+responsive instead of leaving queued denoising work ahead of interactive
+rendering.
+
+Tile sizing is adaptive by default. `maxTileSize` is a hard upper bound; the
+completed GPU time of a tiled execution adjusts the tile size used by the next
+execution. Single-tile images do not affect the estimate. The default range
+starts at 384 pixels, does not go below 256, and targets about 16 ms of GPU work
+per tile.
+
+```ts
+initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
+  aux: true,
+  hdr: true,
+  maxTileSize: 512,
+  dynamicTile: {
+    minTileSize: 256,
+    initialTileSize: 384,
+    targetTileTimeMs: 16
+  }
+});
+
+// Restore fixed-size behavior when deterministic tiling is preferred.
+initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
+  aux: true,
+  hdr: true,
+  maxTileSize: 512,
+  dynamicTile: false
+});
+```
 
 ## Credits
 

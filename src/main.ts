@@ -1,17 +1,64 @@
 import { parseTZA } from './tza';
 import UNet from './UNet';
+import type { UNetEngineSetting } from './UNet';
 import { initWebGPUBackend, initWebGPUBackendWithDevice } from './backend';
+import type { DynamicTileSetting } from './tileScheduler';
+import type { UNetModelSpec } from './modelSpec';
+import type { NativeUNetPrecisionSetting } from './nativeUNet';
 
 export { parseTZA, UNet };
+export type { DynamicTileOptions, DynamicTileSetting } from './tileScheduler';
+export {
+  detectUNetModelSpec,
+  OIDN_UNET_LARGE_SPEC,
+  OIDN_UNET_SMALL_SPEC,
+  validateUNetModel
+} from './modelSpec';
+export type {
+  ModelNodeSpec,
+  UNetModelGraph,
+  UNetModelSpec,
+  ValidatedUNetModel
+} from './modelSpec';
+export { optimizeModelGraph, planModelExecution } from './graphOptimizer';
+export type {
+  ExecutableModelNode,
+  GraphOptimizationOptions,
+  ModelExecutionPlan,
+  ModelValueShape,
+  OptimizedModelGraph
+} from './graphOptimizer';
+export {
+  NativeUNetExecutor,
+  resolveNativeUNetPrecision
+} from './nativeUNet';
+export type {
+  NativeUNetOptions,
+  NativeUNetPrecision,
+  NativeUNetPrecisionSetting
+} from './nativeUNet';
+
+export interface UNetOptions {
+  aux?: boolean;
+  hdr?: boolean;
+  /** Hard upper bound for an output tile edge. Defaults to 512. */
+  maxTileSize?: number;
+  /** Adaptive GPU-time-based tile sizing. Enabled by default. */
+  dynamicTile?: DynamicTileSetting;
+  /** Native WGSL engine selection. `auto` and `wgsl` are currently equivalent. */
+  engine?: UNetEngineSetting;
+  /** `auto` selects FP16 when shader-f16 was enabled on the GPUDevice. */
+  precision?: NativeUNetPrecisionSetting;
+  /** Versioned topology descriptor for future/custom OIDN TZA models. */
+  modelSpec?: UNetModelSpec;
+}
+
+export type { UNetEngineSetting } from './UNet';
 
 export async function initUNetFromBuffer(
   tzaBuffer: ArrayBuffer,
   backendParams?: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
-  opts?: {
-    aux?: boolean;
-    hdr?: boolean;
-    maxTileSize?: number;
-  }
+  opts?: UNetOptions
 ) {
   const backend = await (backendParams
     ? initWebGPUBackendWithDevice(
@@ -20,18 +67,14 @@ export async function initUNetFromBuffer(
       )
     : initWebGPUBackend());
   const tensors = parseTZA(tzaBuffer);
-  const unet = new UNet(tensors, backend!, opts);
+  const unet = new UNet(tensors, backend, opts);
   return unet;
 }
 
 export async function initUNetFromURL(
   modelPath: string,
   backendParams?: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
-  opts?: {
-    aux?: boolean;
-    hdr?: boolean;
-    maxTileSize?: number;
-  }
+  opts?: UNetOptions
 ) {
   return fetch(modelPath)
     .then((res) => res.arrayBuffer())

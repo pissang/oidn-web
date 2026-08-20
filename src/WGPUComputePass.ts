@@ -152,13 +152,15 @@ export class WGPUComputePass<I extends string, O extends string> {
     return this._outputBuffers[name].buffer;
   }
 
-  dispose() {
+  dispose(destroyOutputBuffers = true) {
     Object.keys(this._uniformBuffers).forEach((key) => {
       (this._uniformBuffers as any)[key].destroy();
     });
-    Object.keys(this._outputBuffers).forEach((key) => {
-      (this._outputBuffers as any)[key].buffer.destroy();
-    });
+    if (destroyOutputBuffers) {
+      Object.keys(this._outputBuffers).forEach((key) => {
+        (this._outputBuffers as any)[key].buffer.destroy();
+      });
+    }
   }
 
   private _createBuffer(params: WGPUComputePassOutput) {

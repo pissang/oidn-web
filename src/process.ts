@@ -1,4 +1,3 @@
-import { buffer, data } from '@tensorflow/tfjs';
 import { WGPUComputePass } from './WGPUComputePass';
 
 const a = 1.41283765e3;
@@ -490,5 +489,8 @@ else {
   dispose() {
     this._outputPass.dispose();
     this._inputPassAux.dispose();
+    this._inputPassColor.dispose();
+    // copyPass borrows outputPass's target and must not destroy it again.
+    this._copyPass.dispose(false);
   }
 }

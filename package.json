@@ -9,18 +9,19 @@
     "build": "vite build",
     "dev": "vite dev",
     "watch": "vite build -w",
+    "test": "npm run build:lib && node --test tests/*.test.mjs",
+    "model:inspect": "npm run build:lib && node scripts/inspect-model.mjs",
     "prepublishOnly": "npm run build && npm run build:lib",
-    "build:lib": "tsc",
+    "build:lib": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc",
     "watch:lib": "tsc --watch"
   },
   "author": "pissang",
   "license": "MIT",
   "dependencies": {
-    "@petamoriken/float16": "^3.8.7",
-    "@tensorflow/tfjs": "4.20.0",
-    "@tensorflow/tfjs-backend-webgpu": "4.20.0"
+    "@petamoriken/float16": "^3.8.7"
   },
   "devDependencies": {
+    "@webgpu/types": "^0.1.40",
     "typescript": "^5.7.3",
     "vite": "^5.2.13",
     "vite-plugin-mkcert": "^1.17.5"
