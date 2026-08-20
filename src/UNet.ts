@@ -195,6 +195,9 @@ class UNet {
           }
         : undefined,
       webnn: this._webNNExecutor?.support,
+      resources: (
+        this._webNNExecutor ?? this._nativeExecutor!
+      ).getResourceInfo(),
       model: this._modelSpec.id,
       modelFamily: this._modelSpec.family,
       inputChannels: this._inputChannels,

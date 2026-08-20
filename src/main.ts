@@ -65,6 +65,11 @@ export interface UNetOptions {
 export type { UNetEngineSetting, UNetExecutionStats } from './UNet';
 export { WebNNUNetExecutor } from './webnnUNet';
 export type { WebNNRuntimeSupport, WebNNUNetOptions } from './webnnUNet';
+export type {
+  OIDNResourceKind,
+  OIDNResourceSnapshot,
+  OIDNResourceStats
+} from './resourceTracker';
 
 export async function initUNetFromBuffer(
   tzaBuffer: ArrayBuffer,

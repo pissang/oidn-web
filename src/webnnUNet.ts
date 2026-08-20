@@ -8,6 +8,10 @@ import type {
   NativeUNetPrecision,
   NativeUNetPrecisionSetting
 } from './nativeUNet';
+import {
+  OIDNResourceTracker,
+  type OIDNResourceSnapshot
+} from './resourceTracker.js';
 
 type MLDataType = 'float16' | 'float32';
 type MLOperandLike = object;
@@ -302,10 +306,14 @@ export class WebNNUNetExecutor {
   ) => MLGraphBuilderLike;
   private _shapeCache = new Map<string, WebNNShapeExecution>();
   private _shapePromises = new Map<string, Promise<WebNNShapeExecution>>();
+  private _retiredExecutions = new Set<WebNNShapeExecution>();
+  private _pendingCreationCount = 0;
   private _shapeCacheSize: number;
   private _clock = 0;
   private _inputPipeline: GPUComputePipeline;
   private _outputPipeline: GPUComputePipeline;
+  private _resources = new OIDNResourceTracker();
+  private _disposed = false;
 
   constructor(
     private _device: GPUDevice,
@@ -332,6 +340,7 @@ export class WebNNUNetExecutor {
   }
 
   async prepare() {
+    if (this._disposed) throw new Error('OIDN WebNN executor is disposed');
     const webNN = (globalThis.navigator as any)?.ml;
     const Builder = (globalThis as any).MLGraphBuilder;
     if (!webNN?.createContext || typeof Builder !== 'function') {
@@ -340,51 +349,64 @@ export class WebNNUNetExecutor {
     }
     this._builderConstructor = Builder;
     try {
-      // Chromium's experimental implementation only enables WebGPU tensor
-      // interop for an explicitly GPU-backed context.
-      this._context = await webNN.createContext({
-        deviceType: 'gpu',
-        powerPreference: 'high-performance'
-      });
-    } catch {
-      this._context = await webNN.createContext({ deviceType: 'gpu' });
-    }
+      try {
+        // Chromium's experimental implementation only enables WebGPU tensor
+        // interop for an explicitly GPU-backed context.
+        this._context = await webNN.createContext({
+          deviceType: 'gpu',
+          powerPreference: 'high-performance'
+        });
+      } catch {
+        this._context = await webNN.createContext({ deviceType: 'gpu' });
+      }
+      this._resources.track('ml-context', this._context);
+      if (this._disposed) throw new Error('OIDN WebNN executor is disposed');
 
-    if (
-      typeof this._context.createExportableTensor !== 'function' ||
-      typeof this._context.exportToGPU !== 'function'
-    ) {
-      this.support.reason = 'WebNN WebGPU tensor interop is unavailable';
-      throw new Error(this.support.reason);
-    }
-    const limits = this._context.opSupportLimits?.() ?? {};
-    this.support.fp16Conv =
-      hasDataType(limits, 'conv2d', 'input', 'float16') &&
-      hasDataType(limits, 'conv2d', 'filter', 'float16') &&
-      hasDataType(limits, 'conv2d', 'output', 'float16');
-    if (!this.support.fp16Conv) {
-      this.support.reason = 'WebNN does not support FP16 conv2d';
-      throw new Error(this.support.reason);
-    }
+      if (
+        typeof this._context.createExportableTensor !== 'function' ||
+        typeof this._context.exportToGPU !== 'function'
+      ) {
+        this.support.reason = 'WebNN WebGPU tensor interop is unavailable';
+        throw new Error(this.support.reason);
+      }
+      const limits = this._context.opSupportLimits?.() ?? {};
+      this.support.fp16Conv =
+        hasDataType(limits, 'conv2d', 'input', 'float16') &&
+        hasDataType(limits, 'conv2d', 'filter', 'float16') &&
+        hasDataType(limits, 'conv2d', 'output', 'float16');
+      if (!this.support.fp16Conv) {
+        this.support.reason = 'WebNN does not support FP16 conv2d';
+        throw new Error(this.support.reason);
+      }
 
-    let probe: MLTensorLike | undefined;
-    let probeBuffer: GPUBuffer | undefined;
-    try {
-      probe = await this._context.createExportableTensor(
-        { dataType: 'float16', shape: [4] },
-        this._device
-      );
-      probeBuffer = await this._context.exportToGPU(probe);
-      this.support.gpuInterop = true;
+      let probe: MLTensorLike | undefined;
+      let probeBuffer: GPUBuffer | undefined;
+      try {
+        probe = this._resources.track(
+          'ml-tensor',
+          await this._context.createExportableTensor(
+            { dataType: 'float16', shape: [4] },
+            this._device
+          )
+        );
+        probeBuffer = this._resources.track(
+          'gpu-buffer',
+          await this._context.exportToGPU(probe)
+        );
+        this.support.gpuInterop = true;
+      } catch (error) {
+        this.support.reason =
+          `WebNN FP16 WebGPU interop failed: ${String(error)}`;
+        throw new Error(this.support.reason);
+      } finally {
+        this._releaseBuffer(probeBuffer);
+        this._releaseTensor(probe);
+      }
+      this.support.available = true;
     } catch (error) {
-      this.support.reason =
-        `WebNN FP16 WebGPU interop failed: ${String(error)}`;
-      throw new Error(this.support.reason);
-    } finally {
-      probeBuffer?.destroy();
-      probe?.destroy();
+      this._releaseContext();
+      throw error;
     }
-    this.support.available = true;
   }
 
   private _constant(
@@ -401,6 +423,7 @@ export class WebNNUNetExecutor {
   }
 
   private async _createExecution(width: number, height: number) {
+    if (this._disposed) throw new Error('OIDN WebNN executor is disposed');
     const builder = new this._builderConstructor(this._context);
     const values = new Map<string, MLOperandLike>();
     const shapes = new Map<string, [number, number, number]>();
@@ -479,52 +502,89 @@ export class WebNNUNetExecutor {
       shapes.set(node.id, shape);
     }
 
-    const graph = await builder.build({
-      output: values.get(this._model.spec.output)!
-    });
-    const inputTensor = await this._context.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: [1, this._model.inputChannels, height, width],
-        writable: true
-      },
-      this._device
-    );
-    const outputTensor = await this._context.createExportableTensor(
-      {
-        dataType: 'float16',
-        shape: [1, this._model.outputChannels, height, width],
-        readable: true
-      },
-      this._device
-    );
-    const outputBuffer = this._device.createBuffer({
-      label: `oidn/webnn/output/${width}x${height}`,
-      size: width * height * 4 * 4,
-      usage:
-        GPUBufferUsage.STORAGE |
-        GPUBufferUsage.COPY_SRC |
-        GPUBufferUsage.COPY_DST
-    });
-    return {
-      graph,
-      inputTensor,
-      outputTensor,
-      outputBuffer,
-      inputUniform: uniformBuffer(
-        this._device,
-        `oidn/webnn/input/${width}x${height}`,
-        [width, height, this._model.inputChannels]
-      ),
-      outputUniform: uniformBuffer(
-        this._device,
-        `oidn/webnn/output/${width}x${height}`,
-        [width, height]
-      ),
-      width,
-      height,
-      lastUsed: ++this._clock
-    } satisfies WebNNShapeExecution;
+    let graph: MLGraphLike | undefined;
+    let inputTensor: MLTensorLike | undefined;
+    let outputTensor: MLTensorLike | undefined;
+    let outputBuffer: GPUBuffer | undefined;
+    let inputUniform: GPUBuffer | undefined;
+    let outputUniform: GPUBuffer | undefined;
+    try {
+      graph = this._resources.track(
+        'ml-graph',
+        await builder.build({
+          output: values.get(this._model.spec.output)!
+        })
+      );
+      inputTensor = this._resources.track(
+        'ml-tensor',
+        await this._context.createExportableTensor(
+          {
+            dataType: 'float16',
+            shape: [1, this._model.inputChannels, height, width],
+            writable: true
+          },
+          this._device
+        )
+      );
+      outputTensor = this._resources.track(
+        'ml-tensor',
+        await this._context.createExportableTensor(
+          {
+            dataType: 'float16',
+            shape: [1, this._model.outputChannels, height, width],
+            readable: true
+          },
+          this._device
+        )
+      );
+      outputBuffer = this._resources.track(
+        'gpu-buffer',
+        this._device.createBuffer({
+          label: `oidn/webnn/output/${width}x${height}`,
+          size: width * height * 4 * 4,
+          usage:
+            GPUBufferUsage.STORAGE |
+            GPUBufferUsage.COPY_SRC |
+            GPUBufferUsage.COPY_DST
+        })
+      );
+      inputUniform = this._resources.track(
+        'gpu-buffer',
+        uniformBuffer(
+          this._device,
+          `oidn/webnn/input/${width}x${height}`,
+          [width, height, this._model.inputChannels]
+        )
+      );
+      outputUniform = this._resources.track(
+        'gpu-buffer',
+        uniformBuffer(
+          this._device,
+          `oidn/webnn/output/${width}x${height}`,
+          [width, height]
+        )
+      );
+      const execution: WebNNShapeExecution = {
+        graph,
+        inputTensor,
+        outputTensor,
+        outputBuffer,
+        inputUniform,
+        outputUniform,
+        width,
+        height,
+        lastUsed: ++this._clock
+      };
+      return execution;
+    } catch (error) {
+      this._releaseBuffer(outputUniform);
+      this._releaseBuffer(inputUniform);
+      this._releaseBuffer(outputBuffer);
+      this._releaseTensor(outputTensor);
+      this._releaseTensor(inputTensor);
+      this._releaseGraph(graph);
+      throw error;
+    }
   }
 
   private async _execution(width: number, height: number) {
@@ -533,14 +593,27 @@ export class WebNNUNetExecutor {
     if (!execution) {
       let pending = this._shapePromises.get(key);
       if (!pending) {
-        pending = this._createExecution(width, height);
+        pending = (async () => {
+          this._pendingCreationCount++;
+          try {
+            return await this._createExecution(width, height);
+          } finally {
+            this._pendingCreationCount--;
+          }
+        })();
         this._shapePromises.set(key, pending);
       }
       try {
         execution = await pending;
+        if (this._disposed) {
+          this._destroyExecution(execution);
+          throw new Error('OIDN WebNN executor is disposed');
+        }
         this._shapeCache.set(key, execution);
       } finally {
-        this._shapePromises.delete(key);
+        if (this._shapePromises.get(key) === pending) {
+          this._shapePromises.delete(key);
+        }
       }
       if (this._shapeCache.size > this._shapeCacheSize) {
         const oldest = [...this._shapeCache.entries()]
@@ -548,7 +621,7 @@ export class WebNNUNetExecutor {
           .sort((left, right) => left[1].lastUsed - right[1].lastUsed)[0];
         if (oldest) {
           this._shapeCache.delete(oldest[0]);
-          this._destroyExecution(oldest[1]);
+          this._retireExecution(oldest[1]);
         }
       }
     }
@@ -575,70 +648,78 @@ export class WebNNUNetExecutor {
       );
     }
     const execution = await this._execution(width, height);
-    const inputGPUBuffer = await this._context.exportToGPU(
-      execution.inputTensor
+    const inputGPUBuffer = this._resources.track(
+      'gpu-buffer',
+      await this._context.exportToGPU(execution.inputTensor)
     );
-    const inputEntries: GPUBindGroupEntry[] = inputBuffers.map(
-      (buffer, binding) => ({ binding, resource: { buffer } })
-    );
-    inputEntries.push({
-      binding: sourceCount,
-      resource: { buffer: inputGPUBuffer }
-    });
-    inputEntries.push({
-      binding: sourceCount + 1,
-      resource: { buffer: execution.inputUniform }
-    });
-    const inputBindGroup = this._device.createBindGroup({
-      label: 'oidn/webnn/input-bindings',
-      layout: this._inputPipeline.getBindGroupLayout(0),
-      entries: inputEntries
-    });
-    const inputEncoder = this._device.createCommandEncoder({
-      label: 'oidn/webnn/input-pack'
-    });
-    const inputPass = inputEncoder.beginComputePass();
-    inputPass.setPipeline(this._inputPipeline);
-    inputPass.setBindGroup(0, inputBindGroup);
-    inputPass.dispatchWorkgroups(
-      Math.ceil(width / WORKGROUP_SIZE),
-      Math.ceil(height / WORKGROUP_SIZE),
-      this._model.inputChannels
-    );
-    inputPass.end();
-    this._device.queue.submit([inputEncoder.finish()]);
-    inputGPUBuffer.destroy();
+    try {
+      const inputEntries: GPUBindGroupEntry[] = inputBuffers.map(
+        (buffer, binding) => ({ binding, resource: { buffer } })
+      );
+      inputEntries.push({
+        binding: sourceCount,
+        resource: { buffer: inputGPUBuffer }
+      });
+      inputEntries.push({
+        binding: sourceCount + 1,
+        resource: { buffer: execution.inputUniform }
+      });
+      const inputBindGroup = this._device.createBindGroup({
+        label: 'oidn/webnn/input-bindings',
+        layout: this._inputPipeline.getBindGroupLayout(0),
+        entries: inputEntries
+      });
+      const inputEncoder = this._device.createCommandEncoder({
+        label: 'oidn/webnn/input-pack'
+      });
+      const inputPass = inputEncoder.beginComputePass();
+      inputPass.setPipeline(this._inputPipeline);
+      inputPass.setBindGroup(0, inputBindGroup);
+      inputPass.dispatchWorkgroups(
+        Math.ceil(width / WORKGROUP_SIZE),
+        Math.ceil(height / WORKGROUP_SIZE),
+        this._model.inputChannels
+      );
+      inputPass.end();
+      this._device.queue.submit([inputEncoder.finish()]);
+    } finally {
+      this._releaseBuffer(inputGPUBuffer);
+    }
 
     this._context.dispatch(
       execution.graph,
       { input: execution.inputTensor },
       { output: execution.outputTensor }
     );
-    const outputGPUBuffer = await this._context.exportToGPU(
-      execution.outputTensor
+    const outputGPUBuffer = this._resources.track(
+      'gpu-buffer',
+      await this._context.exportToGPU(execution.outputTensor)
     );
-    const outputBindGroup = this._device.createBindGroup({
-      label: 'oidn/webnn/output-bindings',
-      layout: this._outputPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: outputGPUBuffer } },
-        { binding: 1, resource: { buffer: execution.outputBuffer } },
-        { binding: 2, resource: { buffer: execution.outputUniform } }
-      ]
-    });
-    const outputEncoder = this._device.createCommandEncoder({
-      label: 'oidn/webnn/output-unpack'
-    });
-    const outputPass = outputEncoder.beginComputePass();
-    outputPass.setPipeline(this._outputPipeline);
-    outputPass.setBindGroup(0, outputBindGroup);
-    outputPass.dispatchWorkgroups(
-      Math.ceil(width / WORKGROUP_SIZE),
-      Math.ceil(height / WORKGROUP_SIZE)
-    );
-    outputPass.end();
-    this._device.queue.submit([outputEncoder.finish()]);
-    outputGPUBuffer.destroy();
+    try {
+      const outputBindGroup = this._device.createBindGroup({
+        label: 'oidn/webnn/output-bindings',
+        layout: this._outputPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: outputGPUBuffer } },
+          { binding: 1, resource: { buffer: execution.outputBuffer } },
+          { binding: 2, resource: { buffer: execution.outputUniform } }
+        ]
+      });
+      const outputEncoder = this._device.createCommandEncoder({
+        label: 'oidn/webnn/output-unpack'
+      });
+      const outputPass = outputEncoder.beginComputePass();
+      outputPass.setPipeline(this._outputPipeline);
+      outputPass.setBindGroup(0, outputBindGroup);
+      outputPass.dispatchWorkgroups(
+        Math.ceil(width / WORKGROUP_SIZE),
+        Math.ceil(height / WORKGROUP_SIZE)
+      );
+      outputPass.end();
+      this._device.queue.submit([outputEncoder.finish()]);
+    } finally {
+      this._releaseBuffer(outputGPUBuffer);
+    }
     return execution.outputBuffer;
   }
 
@@ -672,19 +753,60 @@ export class WebNNUNetExecutor {
   }
 
   private _destroyExecution(execution: WebNNShapeExecution) {
-    execution.graph.destroy?.();
-    execution.inputTensor.destroy();
-    execution.outputTensor.destroy();
-    execution.outputBuffer.destroy();
-    execution.inputUniform.destroy();
-    execution.outputUniform.destroy();
+    this._releaseGraph(execution.graph);
+    this._releaseTensor(execution.inputTensor);
+    this._releaseTensor(execution.outputTensor);
+    this._releaseBuffer(execution.outputBuffer);
+    this._releaseBuffer(execution.inputUniform);
+    this._releaseBuffer(execution.outputUniform);
+  }
+
+  private _retireExecution(execution: WebNNShapeExecution) {
+    this._retiredExecutions.add(execution);
+    void this._device.queue.onSubmittedWorkDone().catch(() => undefined).then(() => {
+      this._retiredExecutions.delete(execution);
+      this._destroyExecution(execution);
+    });
+  }
+
+  private _releaseBuffer(buffer: GPUBuffer | undefined) {
+    this._resources.release('gpu-buffer', buffer, () => buffer!.destroy());
+  }
+
+  private _releaseTensor(tensor: MLTensorLike | undefined) {
+    this._resources.release('ml-tensor', tensor, () => tensor!.destroy());
+  }
+
+  private _releaseGraph(graph: MLGraphLike | undefined) {
+    this._resources.release('ml-graph', graph, () => graph!.destroy?.());
+  }
+
+  private _releaseContext() {
+    this._resources.release(
+      'ml-context',
+      this._context,
+      () => this._context.destroy?.()
+    );
+  }
+
+  getResourceInfo(): OIDNResourceSnapshot {
+    return this._resources.snapshot(
+      this._pendingCreationCount + this._retiredExecutions.size
+    );
   }
 
   dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
     for (const execution of this._shapeCache.values()) {
       this._destroyExecution(execution);
     }
     this._shapeCache.clear();
-    this._context?.destroy?.();
+    for (const execution of this._retiredExecutions) {
+      this._destroyExecution(execution);
+    }
+    this._retiredExecutions.clear();
+    this._shapePromises.clear();
+    this._releaseContext();
   }
 }

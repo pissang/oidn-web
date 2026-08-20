@@ -5,7 +5,7 @@ import {
   type ExecutableModelNode,
   type ModelExecutionPlan,
   type ModelValueShape
-} from './graphOptimizer';
+} from './graphOptimizer.js';
 import type {
   Conv2DNodeSpec,
   UNetModelGraph,
@@ -13,6 +13,10 @@ import type {
   ValidatedUNetModel
 } from './modelSpec';
 import type { HostTensor } from './tza';
+import {
+  OIDNResourceTracker,
+  type OIDNResourceSnapshot
+} from './resourceTracker.js';
 
 export type NativeUNetPrecision = 'fp32' | 'fp16';
 export type NativeUNetPrecisionSetting = NativeUNetPrecision | 'auto';
@@ -279,20 +283,26 @@ function packConvTensors(
   const packedBias = new Float32Array(outputBlocks * 4);
   packedBias.set(tensorFloat32Values(tensors.bias));
 
-  return {
-    weights: createMappedBuffer(
-      device,
-      `oidn/${id}/weights/${precision}`,
-      packedWeights,
-      GPUBufferUsage.STORAGE
-    ),
-    bias: createMappedBuffer(
-      device,
-      `oidn/${id}/bias`,
-      packedBias,
-      GPUBufferUsage.STORAGE
-    )
-  };
+  const weights = createMappedBuffer(
+    device,
+    `oidn/${id}/weights/${precision}`,
+    packedWeights,
+    GPUBufferUsage.STORAGE
+  );
+  try {
+    return {
+      weights,
+      bias: createMappedBuffer(
+        device,
+        `oidn/${id}/bias`,
+        packedBias,
+        GPUBufferUsage.STORAGE
+      )
+    };
+  } catch (error) {
+    weights.destroy();
+    throw error;
+  }
 }
 
 function storageVecType(precision: NativeUNetPrecision) {
@@ -1359,10 +1369,14 @@ export class NativeUNetExecutor {
   private _pipelineCache: Map<string, GPUComputePipeline>;
   private _pipelinePromises: Map<string, Promise<GPUComputePipeline>>;
   private _executionCache = new Map<string, CachedExecution>();
+  private _retiredExecutions = new Set<CachedExecution>();
   private _clock = 0;
   private _shapeCacheSize: number;
   private _profileNextExecution = false;
   private _lastExecutionProfile?: Promise<NativeUNetExecutionProfile>;
+  private _profileOperations = 0;
+  private _resources = new OIDNResourceTracker();
+  private _disposed = false;
 
   constructor(
     private _device: GPUDevice,
@@ -1424,11 +1438,20 @@ export class NativeUNetExecutor {
         );
       }
     }
-    for (const [id, tensors] of model.convTensors) {
-      this._packedConvs.set(
-        id,
-        packConvTensors(_device, id, tensors, this.precision)
-      );
+    try {
+      for (const [id, tensors] of model.convTensors) {
+        const packed = packConvTensors(_device, id, tensors, this.precision);
+        this._resources.track('gpu-buffer', packed.weights);
+        this._resources.track('gpu-buffer', packed.bias);
+        this._packedConvs.set(id, packed);
+      }
+    } catch (error) {
+      for (const packed of this._packedConvs.values()) {
+        this._releaseBuffer(packed.weights);
+        this._releaseBuffer(packed.bias);
+      }
+      this._packedConvs.clear();
+      throw error;
     }
   }
 
@@ -1649,6 +1672,7 @@ export class NativeUNetExecutor {
 
   /** Compiles all shape-independent kernels before the model reports ready. */
   async prepare() {
+    if (this._disposed) throw new Error('Native OIDN executor is disposed');
     const graph = optimizeModelGraph(this._model, { fuseConvPool: false });
     const sourceCount = this._model.inputChannels / 3;
     const specs: NativePipelineSpec[] = [
@@ -1676,13 +1700,19 @@ export class NativeUNetExecutor {
       for (const input of executableInputs(node)) lastUses.set(input, index);
     });
     lastUses.set(plan.spec.output, plan.nodes.length);
+    const createdBuffers: GPUBuffer[] = [];
+    const own = (buffer: GPUBuffer) => {
+      createdBuffers.push(buffer);
+      return this._resources.track('gpu-buffer', buffer);
+    };
 
-    const allocate = (
-      value: string,
-      shape: ModelValueShape,
-      bytesPerScalar: number,
-      index: number
-    ) => {
+    try {
+      const allocate = (
+        value: string,
+        shape: ModelValueShape,
+        bytesPerScalar: number,
+        index: number
+      ) => {
       for (const slot of slots) {
         if (
           slot.activeValue &&
@@ -1696,20 +1726,20 @@ export class NativeUNetExecutor {
         .filter((candidate) => !candidate.activeValue && candidate.capacity >= requiredSize)
         .sort((a, b) => a.capacity - b.capacity)[0];
       if (!slot) {
-        const buffer = this._device.createBuffer({
+        const buffer = own(this._device.createBuffer({
           label: `oidn/activation/${width}x${height}/${slots.length}`,
           size: roundUp(requiredSize, 4),
           usage:
             GPUBufferUsage.STORAGE |
             GPUBufferUsage.COPY_SRC |
             GPUBufferUsage.COPY_DST
-        });
+        }));
         slot = { buffer, capacity: requiredSize };
         slots.push(slot);
       }
       slot.activeValue = value;
       valueBuffers.set(value, slot.buffer);
-    };
+      };
 
     allocate(
       plan.spec.input,
@@ -1830,10 +1860,12 @@ export class NativeUNetExecutor {
         throw new Error(`Unexpected native node ${node.op}`);
       }
 
-      const uniform = createUniformBuffer(
-        this._device,
-        `oidn/${node.id}/params/${width}x${height}`,
-        uniformValues
+      const uniform = own(
+        createUniformBuffer(
+          this._device,
+          `oidn/${node.id}/params/${width}x${height}`,
+          uniformValues
+        )
       );
       ownedBuffers.push(uniform);
       entries.push({ binding: entries.length, resource: { buffer: uniform } });
@@ -1846,33 +1878,40 @@ export class NativeUNetExecutor {
       );
     });
 
-    const inputUniform = createUniformBuffer(
-      this._device,
-      `oidn/input/params/${width}x${height}`,
-      [
-        width,
-        height,
-        blocksForChannels(this._model.inputChannels),
-        this._model.inputChannels
-      ]
+    const inputUniform = own(
+      createUniformBuffer(
+        this._device,
+        `oidn/input/params/${width}x${height}`,
+        [
+          width,
+          height,
+          blocksForChannels(this._model.inputChannels),
+          this._model.inputChannels
+        ]
+      )
     );
     ownedBuffers.push(inputUniform);
 
-    return {
-      plan,
-      valueBuffers,
-      slots,
-      nodeBindings,
-      nodePipelines,
-      nodeKernels,
-      inputPipeline,
-      inputUniform,
-      ownedBuffers,
-      lastUsed: ++this._clock
-    };
+      return {
+        plan,
+        valueBuffers,
+        slots,
+        nodeBindings,
+        nodePipelines,
+        nodeKernels,
+        inputPipeline,
+        inputUniform,
+        ownedBuffers,
+        lastUsed: ++this._clock
+      };
+    } catch (error) {
+      for (const buffer of createdBuffers) this._releaseBuffer(buffer);
+      throw error;
+    }
   }
 
   private _execution(width: number, height: number) {
+    if (this._disposed) throw new Error('Native OIDN executor is disposed');
     const key = `${width}x${height}`;
     let execution = this._executionCache.get(key);
     if (!execution) {
@@ -1886,10 +1925,13 @@ export class NativeUNetExecutor {
           this._executionCache.delete(oldest[0]);
           // Commands using an evicted plan may still be submitted. Defer actual
           // destruction until all work currently on the shared queue completes.
-          void this._device.queue.onSubmittedWorkDone().then(() => {
-            oldest[1].slots.forEach((slot) => slot.buffer.destroy());
-            oldest[1].ownedBuffers.forEach((buffer) => buffer.destroy());
-          });
+          this._retiredExecutions.add(oldest[1]);
+          void this._device.queue.onSubmittedWorkDone()
+            .catch(() => undefined)
+            .then(() => {
+              this._retiredExecutions.delete(oldest[1]);
+              this._destroyExecution(oldest[1]);
+            });
         }
       }
     }
@@ -1926,23 +1968,41 @@ export class NativeUNetExecutor {
     this._profileNextExecution = false;
     const queryCount = profileLabels.length * 2;
     const querySet = shouldProfile
-      ? this._device.createQuerySet({ type: 'timestamp', count: queryCount })
+      ? this._resources.track(
+          'gpu-query-set',
+          this._device.createQuerySet({ type: 'timestamp', count: queryCount })
+        )
       : undefined;
     const queryBufferSize = queryCount * 8;
-    const queryResolveBuffer = shouldProfile
-      ? this._device.createBuffer({
-          label: `oidn/profile/resolve/${width}x${height}`,
-          size: queryBufferSize,
-          usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
-        })
-      : undefined;
-    const queryReadbackBuffer = shouldProfile
-      ? this._device.createBuffer({
-          label: `oidn/profile/readback/${width}x${height}`,
-          size: queryBufferSize,
-          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-        })
-      : undefined;
+    let queryResolveBuffer: GPUBuffer | undefined;
+    let queryReadbackBuffer: GPUBuffer | undefined;
+    try {
+      queryResolveBuffer = shouldProfile
+        ? this._resources.track(
+            'gpu-buffer',
+            this._device.createBuffer({
+              label: `oidn/profile/resolve/${width}x${height}`,
+              size: queryBufferSize,
+              usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+            })
+          )
+        : undefined;
+      queryReadbackBuffer = shouldProfile
+        ? this._resources.track(
+            'gpu-buffer',
+            this._device.createBuffer({
+              label: `oidn/profile/readback/${width}x${height}`,
+              size: queryBufferSize,
+              usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+            })
+          )
+        : undefined;
+    } catch (error) {
+      this._releaseBuffer(queryReadbackBuffer);
+      this._releaseBuffer(queryResolveBuffer);
+      this._releaseQuerySet(querySet);
+      throw error;
+    }
     const passDescriptor = (label: string, index: number) => ({
       label,
       ...(querySet
@@ -1955,9 +2015,10 @@ export class NativeUNetExecutor {
           }
         : {})
     });
-    const encoder = this._device.createCommandEncoder({
-      label: `oidn/native/${width}x${height}`
-    });
+    try {
+      const encoder = this._device.createCommandEncoder({
+        label: `oidn/native/${width}x${height}`
+      });
 
     const inputEntries: GPUBindGroupEntry[] = inputBuffers.map(
       (buffer, binding) => ({ binding, resource: { buffer } })
@@ -2032,8 +2093,15 @@ export class NativeUNetExecutor {
       );
     }
 
-    this._device.queue.submit([encoder.finish()]);
+      this._device.queue.submit([encoder.finish()]);
+    } catch (error) {
+      this._releaseBuffer(queryReadbackBuffer);
+      this._releaseBuffer(queryResolveBuffer);
+      this._releaseQuerySet(querySet);
+      throw error;
+    }
     if (querySet) {
+      this._profileOperations++;
       this._lastExecutionProfile = (async () => {
         try {
           await queryReadbackBuffer!.mapAsync(GPUMapMode.READ);
@@ -2057,9 +2125,10 @@ export class NativeUNetExecutor {
           if (queryReadbackBuffer!.mapState === 'mapped') {
             queryReadbackBuffer!.unmap();
           }
-          querySet.destroy();
-          queryResolveBuffer!.destroy();
-          queryReadbackBuffer!.destroy();
+          this._releaseQuerySet(querySet);
+          this._releaseBuffer(queryResolveBuffer);
+          this._releaseBuffer(queryReadbackBuffer);
+          this._profileOperations--;
         }
       })();
     }
@@ -2088,6 +2157,7 @@ export class NativeUNetExecutor {
           size: pixelCount * 16,
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
         });
+        this._resources.track('gpu-buffer', buffer);
         execution.ownedBuffers.push(buffer);
         return buffer;
       });
@@ -2096,6 +2166,7 @@ export class NativeUNetExecutor {
         size: pixelCount * 16,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
       });
+      this._resources.track('gpu-buffer', execution.cpuReadbackBuffer);
       execution.ownedBuffers.push(execution.cpuReadbackBuffer);
     }
 
@@ -2142,17 +2213,44 @@ export class NativeUNetExecutor {
     return rgb;
   }
 
+  private _releaseBuffer(buffer: GPUBuffer | undefined) {
+    this._resources.release('gpu-buffer', buffer, () => buffer!.destroy());
+  }
+
+  private _releaseQuerySet(querySet: GPUQuerySet | undefined) {
+    this._resources.release(
+      'gpu-query-set',
+      querySet,
+      () => querySet!.destroy()
+    );
+  }
+
+  private _destroyExecution(execution: CachedExecution) {
+    execution.slots.forEach((slot) => this._releaseBuffer(slot.buffer));
+    execution.ownedBuffers.forEach((buffer) => this._releaseBuffer(buffer));
+  }
+
+  getResourceInfo(): OIDNResourceSnapshot {
+    return this._resources.snapshot(
+      this._retiredExecutions.size + this._profileOperations
+    );
+  }
+
   dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
     for (const packed of this._packedConvs.values()) {
-      packed.weights.destroy();
-      packed.bias.destroy();
+      this._releaseBuffer(packed.weights);
+      this._releaseBuffer(packed.bias);
     }
     this._packedConvs.clear();
     for (const execution of this._executionCache.values()) {
-      execution.slots.forEach((slot) => slot.buffer.destroy());
-      execution.ownedBuffers.forEach((buffer) => buffer.destroy());
+      this._destroyExecution(execution);
     }
     this._executionCache.clear();
-    this._pipelineCache.clear();
+    for (const execution of this._retiredExecutions) {
+      this._destroyExecution(execution);
+    }
+    this._retiredExecutions.clear();
   }
 }
