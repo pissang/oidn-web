@@ -13,13 +13,18 @@ It's used in the [Vector to 3D](https://www.figma.com/community/plugin/126460021
 
 The OIDN U-Net runs directly on WebGPU with model-driven WGSL compute
 pipelines. TensorFlow.js is not used. Convolution activations use a blocked
-four-channel layout, encoder `conv + ReLU + max-pool` and decoder
-`upsample + concat + conv` patterns are fused, and all network dispatches for a
-tile are submitted in one command buffer.
+four-channel layout, decoder `upsample + concat + conv` patterns are fused,
+and all network dispatches for a tile are submitted in one command buffer.
+FP32 convolutions use channel-specialized implicit-GEMM tiles; FP16 uses
+channel-specialized vector FMA and separate max-pool passes, selected from the
+same model descriptor.
 
 TZA half-float weights stay half-float when the device enables `shader-f16`.
-Convolution accumulates in FP32 and the final output is FP32. Devices without
-`shader-f16` automatically use the native FP32 path.
+FP16 products are accumulated in short half-precision groups and periodically
+folded into FP32 accumulators; the final output is FP32. Devices without
+`shader-f16` automatically use the native FP32 path. Shape-independent compute
+pipelines compile asynchronously before initialization resolves, so first-use
+shader compilation does not interrupt an interactive denoise.
 
 ## How to Use
 
@@ -183,6 +188,22 @@ console.log(unet.getRuntimeInfo());
 // { gpuEngine: 'wgsl', precision: 'fp16', model: 'oidn-unet-large-v1', ... }
 ```
 
+For one-shot native GPU timings, request a profile immediately before an
+execution. This is available when the shared device enabled `timestamp-query`:
+
+```ts
+if (unet.profileNextExecution()) {
+  unet.tileExecute({
+    color,
+    albedo,
+    normal,
+    done: async () => {
+      console.table((await unet.getLastExecutionProfile()).layers);
+    }
+  });
+}
+```
+
 ### Updating to a new OIDN model
 
 TZA stores tensors but not the executable graph. The runtime therefore keeps
@@ -252,7 +273,9 @@ The browser benchmark automatically finds the nearest ancestor whose package
 still depends on TensorFlow.js, builds that commit in a temporary worktree, and
 compares it with the current WGSL FP32 and FP16 runtimes. Each measured run
 waits for the WebGPU queue to finish, so the result includes execution rather
-than only JavaScript command submission.
+than only JavaScript command submission. It also samples output against the
+TFJS FP32 result and, when timestamp queries are supported, reports the five
+most expensive native network nodes.
 
 ```shell
 npm run benchmark -- --width 512 --height 512 --tile-size 512 --runs 5

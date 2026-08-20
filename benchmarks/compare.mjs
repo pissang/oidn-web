@@ -197,6 +197,33 @@ function summarize(times) {
   };
 }
 
+function compareSamples(reference, candidate) {
+  if (!reference || !candidate || reference.length !== candidate.length) {
+    return {
+      passed: false,
+      reason: 'output sample count mismatch'
+    };
+  }
+  let absoluteError = 0;
+  let squaredError = 0;
+  let maxAbsoluteError = 0;
+  for (let index = 0; index < reference.length; index++) {
+    const error = Math.abs(reference[index] - candidate[index]);
+    if (!Number.isFinite(error)) {
+      return { passed: false, reason: `non-finite output at sample ${index}` };
+    }
+    absoluteError += error;
+    squaredError += error * error;
+    maxAbsoluteError = Math.max(maxAbsoluteError, error);
+  }
+  return {
+    sampleCount: reference.length,
+    meanAbsoluteError: absoluteError / reference.length,
+    rootMeanSquaredError: Math.sqrt(squaredError / reference.length),
+    maxAbsoluteError
+  };
+}
+
 async function benchmarkVariant(browser, origin, options, variant) {
   const page = await browser.newPage();
   const messages = [];
@@ -217,6 +244,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
         return { skipped: 'shader-f16 is unavailable' };
       }
       const requiredFeatures = config.precision === 'fp16' ? ['shader-f16'] : [];
+      if (adapter.features.has('timestamp-query')) requiredFeatures.push('timestamp-query');
       const device = await adapter.requestDevice({
         requiredFeatures,
         requiredLimits: {
@@ -289,6 +317,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
         normal: createInputBuffer('normal')
       };
       const image = (data) => ({ data, width: config.width, height: config.height });
+      let lastOutput;
       const execute = async () => {
         const startedAt = performance.now();
         await new Promise((resolve, reject) => {
@@ -297,7 +326,10 @@ async function benchmarkVariant(browser, origin, options, variant) {
               color: image(buffers.color),
               albedo: image(buffers.albedo),
               normal: image(buffers.normal),
-              done: resolve
+              done: (output) => {
+                lastOutput = output;
+                resolve();
+              }
             });
           } catch (error) {
             reject(error);
@@ -309,6 +341,39 @@ async function benchmarkVariant(browser, origin, options, variant) {
       for (let index = 0; index < config.warmup; index++) await execute();
       const timesMs = [];
       for (let index = 0; index < config.runs; index++) timesMs.push(await execute());
+      let executionProfile;
+      if (unet.profileNextExecution?.()) {
+        await execute();
+        executionProfile = await unet.getLastExecutionProfile?.();
+      }
+      if (!lastOutput?.data) throw new Error('OIDN did not return an output buffer');
+      const outputReadback = device.createBuffer({
+        size: pixelCount * 16,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+      });
+      const outputEncoder = device.createCommandEncoder();
+      outputEncoder.copyBufferToBuffer(
+        lastOutput.data,
+        0,
+        outputReadback,
+        0,
+        pixelCount * 16
+      );
+      device.queue.submit([outputEncoder.finish()]);
+      await outputReadback.mapAsync(GPUMapMode.READ);
+      const outputValues = new Float32Array(outputReadback.getMappedRange());
+      const outputSamples = [];
+      const sampleStride = Math.max(1, Math.floor(pixelCount / 2048));
+      for (let pixel = 0; pixel < pixelCount; pixel += sampleStride) {
+        const offset = pixel * 4;
+        outputSamples.push(
+          outputValues[offset],
+          outputValues[offset + 1],
+          outputValues[offset + 2]
+        );
+      }
+      outputReadback.unmap();
+      outputReadback.destroy();
       const runtimeInfo = unet.getRuntimeInfo?.();
       unet.dispose?.();
       Object.values(buffers).forEach((buffer) => buffer.destroy());
@@ -316,6 +381,8 @@ async function benchmarkVariant(browser, origin, options, variant) {
       return {
         initializationMs,
         timesMs,
+        executionProfile,
+        outputSamples,
         runtimeInfo,
         supportsFP16,
         adapter: {
@@ -352,6 +419,10 @@ function formatNumber(value) {
   return value == null ? '-' : value.toFixed(2);
 }
 
+function formatExponential(value) {
+  return Number.isFinite(value) ? value.toExponential(2) : '-';
+}
+
 function markdownReport(report) {
   const baselineMedian = report.results.find((result) => result.baseline)?.summary?.medianMs;
   const rows = report.results.map((result) => {
@@ -359,13 +430,37 @@ function markdownReport(report) {
     const speedup = baselineMedian / result.summary.medianMs;
     return `| ${result.label} | ${formatNumber(result.initializationMs)} | ${formatNumber(result.summary.medianMs)} | ${formatNumber(result.summary.p95Ms)} | ${speedup.toFixed(2)}x | ${result.runtimeInfo?.precision ?? 'fp32'} |`;
   });
+  const validationRows = report.results
+    .filter((result) => !result.baseline && !result.skipped)
+    .map((result) => {
+      const validation = result.validation;
+      const status = validation.passed ? 'pass' : 'FAIL';
+      return `| ${result.label} | ${status} | ${formatExponential(validation.meanAbsoluteError)} | ${formatExponential(validation.rootMeanSquaredError)} | ${formatExponential(validation.maxAbsoluteError)} | ${validation.sampleCount ?? '-'} |`;
+    });
+  const profileSections = report.results
+    .filter((result) => result.executionProfile)
+    .map((result) => {
+      const hotLayers = [...result.executionProfile.layers]
+        .sort((left, right) => right.durationMs - left.durationMs)
+        .slice(0, 5)
+        .map((layer) => `| ${layer.id} | ${formatNumber(layer.durationMs)} |`)
+        .join('\n');
+      return `### ${result.label}\n\n` +
+        `Profiled GPU total: ${formatNumber(result.executionProfile.totalMs)} ms\n\n` +
+        `| Node | GPU ms |\n| --- | ---: |\n${hotLayers}`;
+    });
   return `# oidn-web benchmark\n\n` +
     `- Current: \`${report.currentCommit}\`\n` +
     `- TFJS baseline: \`${report.baselineCommit}\`\n` +
     `- Input: ${report.settings.width}x${report.settings.height}, fixed tile ${report.settings.tileSize}, ${report.settings.runs} runs after ${report.settings.warmup} warmup(s)\n` +
     `- Adapter: ${report.adapter.description || report.adapter.device || report.adapter.vendor || 'unknown'}\n\n` +
     `| Runtime | Init ms | Median ms | P95 ms | Speedup | Precision |\n` +
-    `| --- | ---: | ---: | ---: | ---: | --- |\n${rows.join('\n')}\n`;
+    `| --- | ---: | ---: | ---: | ---: | --- |\n${rows.join('\n')}\n\n` +
+    `## Output validation\n\n` +
+    `Compared against sampled TFJS FP32 output.\n\n` +
+    `| Runtime | Status | MAE | RMSE | Max error | Samples |\n` +
+    `| --- | --- | ---: | ---: | ---: | ---: |\n${validationRows.join('\n')}\n\n` +
+    `## GPU hot layers\n\n${profileSections.join('\n\n') || 'Timestamp queries unavailable.'}\n`;
 }
 
 async function main() {
@@ -422,6 +517,26 @@ async function main() {
       console.log(`Benchmarking ${variant.label}...`);
       results.push(await benchmarkVariant(browser, server.origin, options, variant));
     }
+    const referenceSamples = results.find((result) => result.baseline)?.outputSamples;
+    for (const result of results) {
+      if (!result.baseline && !result.skipped) {
+        const comparison = compareSamples(referenceSamples, result.outputSamples);
+        const maxMeanError = result.precision === 'fp16' ? 5e-3 : 1e-4;
+        const maxAbsoluteError = result.precision === 'fp16' ? 5e-2 : 1e-3;
+        const hasComparableOutput =
+          Number.isFinite(comparison.meanAbsoluteError) &&
+          Number.isFinite(comparison.maxAbsoluteError);
+        result.validation = {
+          ...comparison,
+          passed:
+            hasComparableOutput &&
+            comparison.meanAbsoluteError <= maxMeanError &&
+            comparison.maxAbsoluteError <= maxAbsoluteError,
+          thresholds: { maxMeanError, maxAbsoluteError }
+        };
+      }
+      delete result.outputSamples;
+    }
     const firstCompleted = results.find((result) => !result.skipped);
     const report = {
       generatedAt: new Date().toISOString(),
@@ -450,6 +565,12 @@ async function main() {
     console.log(`\n${markdown}`);
     console.log(`JSON: ${options.output}`);
     console.log(`Markdown: ${markdownPath}`);
+    const failedValidation = results.find(
+      (result) => result.validation && !result.validation.passed
+    );
+    if (failedValidation) {
+      throw new Error(`${failedValidation.label} output validation failed`);
+    }
   } finally {
     await browser?.close();
     await server?.close();

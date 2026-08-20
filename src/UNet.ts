@@ -146,6 +146,11 @@ class UNet {
     return this._device;
   }
 
+  /** Completes native pipeline compilation before first interactive use. */
+  async prepare() {
+    await this._nativeExecutor.prepare();
+  }
+
   getRuntimeInfo() {
     return {
       configuredEngine: this._engine,
@@ -163,6 +168,15 @@ class UNet {
       },
       lastExecution: this._lastExecution
     };
+  }
+
+  /** Captures per-node GPU timestamps for the next native tile execution. */
+  profileNextExecution() {
+    return this._nativeExecutor.profileNextExecution();
+  }
+
+  getLastExecutionProfile() {
+    return this._nativeExecutor.getLastExecutionProfile();
   }
 
   private _updateModel(width: number, height: number) {

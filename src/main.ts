@@ -33,6 +33,8 @@ export {
   resolveNativeUNetPrecision
 } from './nativeUNet';
 export type {
+  NativeUNetExecutionProfile,
+  NativeUNetLayerTiming,
   NativeUNetOptions,
   NativeUNetPrecision,
   NativeUNetPrecisionSetting
@@ -68,6 +70,7 @@ export async function initUNetFromBuffer(
     : initWebGPUBackend());
   const tensors = parseTZA(tzaBuffer);
   const unet = new UNet(tensors, backend, opts);
+  await unet.prepare();
   return unet;
 }
 
