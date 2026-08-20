@@ -130,3 +130,6 @@ dist
 .pnp.*
 
 lib
+
+# Local browser benchmark output
+benchmarks/results/

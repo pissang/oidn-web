@@ -246,6 +246,22 @@ initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
 });
 ```
 
+### Benchmark the native runtime against TFJS
+
+The browser benchmark automatically finds the nearest ancestor whose package
+still depends on TensorFlow.js, builds that commit in a temporary worktree, and
+compares it with the current WGSL FP32 and FP16 runtimes. Each measured run
+waits for the WebGPU queue to finish, so the result includes execution rather
+than only JavaScript command submission.
+
+```shell
+npm run benchmark -- --width 512 --height 512 --tile-size 512 --runs 5
+```
+
+Results are printed as a table and written to
+`benchmarks/results/latest.{json,md}`. Use `--baseline <commit>` to pin an
+explicit historical version or `--chrome <path>` to select a browser.
+
 ## Credits
 
 Huge thanks to Max Liani for his series: https://maxliani.wordpress.com/2023/03/17/dnnd-1-a-deep-neural-network-dive/. My work is mostly inspired by it.

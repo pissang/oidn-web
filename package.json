@@ -10,6 +10,7 @@
     "dev": "vite dev",
     "watch": "vite build -w",
     "test": "npm run build:lib && node --test tests/*.test.mjs",
+    "benchmark": "node benchmarks/compare.mjs",
     "model:inspect": "npm run build:lib && node scripts/inspect-model.mjs",
     "prepublishOnly": "npm run build && npm run build:lib",
     "build:lib": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc",
@@ -22,6 +23,7 @@
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.40",
+    "playwright-core": "^1.62.1",
     "typescript": "^5.7.3",
     "vite": "^5.2.13",
     "vite-plugin-mkcert": "^1.17.5"

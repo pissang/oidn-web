@@ -1,6 +1,6 @@
 import { parseTZA } from './tza';
 import UNet from './UNet';
-import type { UNetEngineSetting } from './UNet';
+import type { UNetEngineSetting, UNetExecutionStats } from './UNet';
 import { initWebGPUBackend, initWebGPUBackendWithDevice } from './backend';
 import type { DynamicTileSetting } from './tileScheduler';
 import type { UNetModelSpec } from './modelSpec';
@@ -53,7 +53,7 @@ export interface UNetOptions {
   modelSpec?: UNetModelSpec;
 }
 
-export type { UNetEngineSetting } from './UNet';
+export type { UNetEngineSetting, UNetExecutionStats } from './UNet';
 
 export async function initUNetFromBuffer(
   tzaBuffer: ArrayBuffer,

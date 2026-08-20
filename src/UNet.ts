@@ -43,6 +43,21 @@ interface GPUImageDataOutput {
   height: number;
 }
 
+export interface UNetExecutionStats {
+  width: number;
+  height: number;
+  tileWidth: number;
+  tileHeight: number;
+  tileCount: number;
+  durationMs: number;
+  tileTimeMs: {
+    min: number;
+    median: number;
+    mean: number;
+    max: number;
+  };
+}
+
 function roundUp(a: number, b: number) {
   return Math.ceil(a / b) * b;
 }
@@ -74,6 +89,7 @@ class UNet {
   private _engine: UNetEngineSetting;
 
   private _dynamicTileController: DynamicTileController;
+  private _lastExecution?: UNetExecutionStats;
 
   constructor(
     hostTensors: Map<string, HostTensor>,
@@ -137,7 +153,15 @@ class UNet {
       precision: this._nativeExecutor.precision,
       model: this._modelSpec.id,
       modelFamily: this._modelSpec.family,
-      inputChannels: this._inputChannels
+      inputChannels: this._inputChannels,
+      dynamicTile: {
+        enabled: this._dynamicTileController.enabled,
+        currentTileSize: this._dynamicTileController.tileSize,
+        minTileSize: this._dynamicTileController.minTileSize,
+        maxTileSize: this._dynamicTileController.maxTileSize,
+        targetTileTimeMs: this._dynamicTileController.targetTileTimeMs
+      },
+      lastExecution: this._lastExecution
     };
   }
 
@@ -501,9 +525,10 @@ class UNet {
 
     let aborted = false;
 
-    const tileTimesMs: number[] = [];
     const now = () =>
       typeof performance === 'undefined' ? Date.now() : performance.now();
+    const executionStartTime = now();
+    const tileTimesMs: number[] = [];
     const scheduleNextTile = (callback: () => void) => {
       if (typeof requestAnimationFrame === 'undefined') {
         setTimeout(callback, 0);
@@ -564,6 +589,27 @@ class UNet {
             }
           });
         } else {
+          const sortedTileTimes = [...tileTimesMs].sort((a, b) => a - b);
+          const middle = Math.floor(sortedTileTimes.length / 2);
+          const medianTileTime = sortedTileTimes.length % 2
+            ? sortedTileTimes[middle]
+            : (sortedTileTimes[middle - 1] + sortedTileTimes[middle]) / 2;
+          this._lastExecution = {
+            width,
+            height,
+            tileWidth,
+            tileHeight,
+            tileCount: tileCountW * tileCountH,
+            durationMs: now() - executionStartTime,
+            tileTimeMs: {
+              min: sortedTileTimes[0],
+              median: medianTileTime,
+              mean:
+                sortedTileTimes.reduce((sum, value) => sum + value, 0) /
+                sortedTileTimes.length,
+              max: sortedTileTimes[sortedTileTimes.length - 1]
+            }
+          };
           // Adapt only from complete executions. Cancelled work is commonly
           // contending with interactive rendering and is not representative.
           if (shouldAdaptTileSize) {
