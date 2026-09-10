@@ -489,6 +489,7 @@ class UNet {
     progress,
     denoiseAlpha,
     tileOverlap,
+    wholeImage,
     scheduling = 'animation-frame'
   }: {
     color: T;
@@ -498,6 +499,8 @@ class UNet {
      * If denoise alpha channel. Otherwise denoise RGB channels.
      */
     denoiseAlpha?: boolean;
+    /** Execute the complete input image as one tile when it fits GPU limits. */
+    wholeImage?: boolean;
     /**
      * Per-side context for boundaries shared with another tile. Defaults to
      * half of the model receptive field rounded up to 16 pixels.
@@ -527,6 +530,9 @@ class UNet {
     const width = color.width;
     const height = color.height;
     const adaptiveTileSize = this._dynamicTileController.tileSize;
+    const requestedTileSize = wholeImage
+      ? Math.max(width, height)
+      : adaptiveTileSize;
     const defaultTileOverlap = roundUp(
       this._modelSpec.receptiveField / 2,
       OIDN_TILE_ALIGNMENT
@@ -537,7 +543,7 @@ class UNet {
     const plan = planTileGrid(
       width,
       height,
-      adaptiveTileSize,
+      requestedTileSize,
       resolvedTileOverlap
     );
     const shouldAdaptTileSize = plan.tiles.length > 1;

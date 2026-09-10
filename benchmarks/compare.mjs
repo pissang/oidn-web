@@ -21,7 +21,8 @@ Options:
   --tile-size <n>      Fixed output tile edge (default: 512)
   --warmup <n>         Warmup executions per runtime (default: 1)
   --runs <n>           Measured executions per runtime (default: 5)
-  --baseline <commit>  TFJS commit (default: nearest TFJS ancestor)
+  --input-hdr <path>   Use a static Radiance HDR as the color input
+  --baseline <commit>  Reference commit (default: nearest TFJS ancestor)
   --chrome <path>      Chrome/Chromium executable
   --output <path>      JSON output (default: benchmarks/results/latest.json)
   --help               Show this message
@@ -35,6 +36,7 @@ function parseArgs(argv) {
     tileSize: 512,
     warmup: 1,
     runs: 5,
+    inputHDR: null,
     output: path.join(benchmarkDirectory, 'results/latest.json')
   };
   const names = {
@@ -43,6 +45,7 @@ function parseArgs(argv) {
     'tile-size': 'tileSize',
     warmup: 'warmup',
     runs: 'runs',
+    'input-hdr': 'inputHDR',
     baseline: 'baseline',
     chrome: 'chrome',
     output: 'output'
@@ -74,7 +77,69 @@ function parseArgs(argv) {
     throw new Error('warmup must be a non-negative integer');
   }
   options.output = path.resolve(projectRoot, options.output);
+  if (options.inputHDR) options.inputHDR = path.resolve(process.cwd(), options.inputHDR);
   return options;
+}
+
+function decodeRadianceHDR(bytes) {
+  const headerEnd = bytes.indexOf('\n\n');
+  if (headerEnd < 0) throw new Error('HDR header is missing the blank line');
+  const header = new TextDecoder().decode(bytes.subarray(0, headerEnd + 2));
+  if (!header.includes('FORMAT=32-bit_rle_rgbe')) {
+    throw new Error('Only 32-bit RLE RGBE HDR files are supported');
+  }
+  const resolutionEnd = bytes.indexOf('\n', headerEnd + 2);
+  const resolution = new TextDecoder().decode(
+    bytes.subarray(headerEnd + 2, resolutionEnd)
+  ).trim().match(/^-Y (\d+) \+X (\d+)$/);
+  if (!resolution) throw new Error('Unsupported HDR resolution');
+  const height = Number(resolution[1]);
+  const width = Number(resolution[2]);
+  const rgba = new Float32Array(width * height * 4);
+  let offset = resolutionEnd + 1;
+  const decodePixel = (pixelOffset, r, g, b, e) => {
+    const scale = e ? 2 ** (e - 136) : 0;
+    rgba[pixelOffset] = r * scale;
+    rgba[pixelOffset + 1] = g * scale;
+    rgba[pixelOffset + 2] = b * scale;
+    rgba[pixelOffset + 3] = 1;
+  };
+  for (let y = 0; y < height; y++) {
+    const rle = bytes[offset] === 2 && bytes[offset + 1] === 2 &&
+      !(bytes[offset + 2] & 0x80) &&
+      ((bytes[offset + 2] << 8) | bytes[offset + 3]) === width;
+    if (!rle || width < 8 || width >= 32768) {
+      for (let x = 0; x < width; x++) {
+        const pixel = (y * width + x) * 4;
+        decodePixel(pixel, bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+        offset += 4;
+      }
+      continue;
+    }
+    offset += 4;
+    const scanline = new Uint8Array(width * 4);
+    for (let channel = 0; channel < 4; channel++) {
+      let x = 0;
+      while (x < width) {
+        const count = bytes[offset++];
+        if (count > 128) {
+          const length = count - 128;
+          const value = bytes[offset++];
+          scanline.fill(value, channel * width + x, channel * width + x + length);
+          x += length;
+        } else {
+          scanline.set(bytes.subarray(offset, offset + count), channel * width + x);
+          offset += count;
+          x += count;
+        }
+      }
+    }
+    for (let x = 0; x < width; x++) {
+      const pixel = (y * width + x) * 4;
+      decodePixel(pixel, scanline[x], scanline[width + x], scanline[2 * width + x], scanline[3 * width + x]);
+    }
+  }
+  return { width, height, rgba };
 }
 
 function defaultChrome() {
@@ -137,7 +202,9 @@ async function findTFJSBaseline(explicitCommit) {
 
 function contentType(filePath) {
   if (filePath.endsWith('.js')) return 'text/javascript; charset=utf-8';
-  if (filePath.endsWith('.tza')) return 'application/octet-stream';
+  if (filePath.endsWith('.tza') || filePath.endsWith('.bin')) {
+    return 'application/octet-stream';
+  }
   return 'text/html; charset=utf-8';
 }
 
@@ -273,7 +340,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
         hdr: true,
         maxTileSize: config.tileSize
       };
-      if (!config.baseline) {
+      if (!config.baseline || config.nativeOptions) {
         runtimeOptions.engine = config.engine ?? 'wgsl';
         runtimeOptions.precision = config.precision;
         runtimeOptions.kernel = config.kernel;
@@ -295,7 +362,16 @@ async function benchmarkVariant(browser, origin, options, variant) {
       const initializationMs = performance.now() - initStartedAt;
 
       const pixelCount = config.width * config.height;
+      const staticColor = config.inputUrl
+        ? new Float32Array(await fetch(config.inputUrl).then((response) => response.arrayBuffer()))
+        : null;
+      if (staticColor && staticColor.length !== pixelCount * 4) {
+        throw new Error(
+          `Static HDR dimensions do not match benchmark input: ${staticColor.length / 4} pixels`
+        );
+      }
       const makePixels = (kind) => {
+        if (kind === 'color' && staticColor) return staticColor;
         const values = new Float32Array(pixelCount * 4);
         for (let index = 0; index < pixelCount; index++) {
           const x = index % config.width;
@@ -417,11 +493,13 @@ async function benchmarkVariant(browser, origin, options, variant) {
       precision: variant.precision,
       kernel: variant.kernel,
       engine: variant.engine,
+      nativeOptions: variant.nativeOptions,
       width: options.width,
       height: options.height,
       tileSize: options.tileSize,
       warmup: options.warmup,
-      runs: options.runs
+      runs: options.runs,
+      inputUrl: options.inputHDR ? `${origin}/input.bin` : null
     });
     if (result.skipped) return { ...variant, skipped: result.skipped, messages };
     return {
@@ -445,6 +523,7 @@ function formatExponential(value) {
 
 function markdownReport(report) {
   const baselineMedian = report.results.find((result) => result.baseline)?.summary?.medianMs;
+  const baselineKind = report.settings.referenceRuntime ? 'reference runtime' : 'TFJS';
   const rows = report.results.map((result) => {
     if (result.skipped) return `| ${result.label} | skipped | - | - | - | ${result.skipped} |`;
     const speedup = baselineMedian / result.summary.medianMs;
@@ -471,13 +550,13 @@ function markdownReport(report) {
     });
   return `# oidn-web benchmark\n\n` +
     `- Current: \`${report.currentCommit}\`\n` +
-    `- TFJS baseline: \`${report.baselineCommit}\`\n` +
+    `- ${baselineKind[0].toUpperCase()}${baselineKind.slice(1)} baseline: \`${report.baselineCommit}\`\n` +
     `- Input: ${report.settings.width}x${report.settings.height}, fixed tile ${report.settings.tileSize}, ${report.settings.runs} runs after ${report.settings.warmup} warmup(s)\n` +
     `- Adapter: ${report.adapter.description || report.adapter.device || report.adapter.vendor || 'unknown'}\n\n` +
     `| Runtime | Init ms | Median ms | P95 ms | Speedup | Precision |\n` +
     `| --- | ---: | ---: | ---: | ---: | --- |\n${rows.join('\n')}\n\n` +
     `## Output validation\n\n` +
-    `Compared against sampled TFJS FP32 output.\n\n` +
+    `Compared against sampled ${baselineKind} output.\n\n` +
     `| Runtime | Status | MAE | RMSE | Max error | Samples |\n` +
     `| --- | --- | ---: | ---: | ---: | ---: |\n${validationRows.join('\n')}\n\n` +
     `## GPU hot layers\n\n${profileSections.join('\n\n') || 'Timestamp queries unavailable.'}\n`;
@@ -493,7 +572,7 @@ async function main() {
   if (!chrome) throw new Error('Chrome/Chromium not found; pass --chrome or CHROME_PATH');
   const baselineCommit = await findTFJSBaseline(options.baseline);
   const currentCommit = await gitText(['rev-parse', 'HEAD']);
-  console.log(`TFJS baseline: ${baselineCommit.slice(0, 12)}`);
+  console.log(`${options.baseline ? 'Reference' : 'TFJS'} baseline: ${baselineCommit.slice(0, 12)}`);
   console.log(`Current runtime: ${currentCommit.slice(0, 12)} + working tree`);
 
   await run('npm', ['run', 'build']);
@@ -503,6 +582,20 @@ async function main() {
   let server;
   let browser;
   try {
+    let staticHDR;
+    let inputPath;
+    if (options.inputHDR) {
+      staticHDR = decodeRadianceHDR(await readFile(options.inputHDR));
+      if (options.width !== staticHDR.width || options.height !== staticHDR.height) {
+        throw new Error(
+          `--input-hdr is ${staticHDR.width}x${staticHDR.height}; ` +
+          `pass --width ${staticHDR.width} --height ${staticHDR.height}`
+        );
+      }
+      inputPath = path.join(temporaryRoot, 'input.rgba32.bin');
+      await writeFile(inputPath, Buffer.from(staticHDR.rgba.buffer));
+      console.log(`Static HDR input: ${options.inputHDR} (${staticHDR.width}x${staticHDR.height})`);
+    }
     // The repository stores model files through Git LFS, but the benchmark
     // serves the current checkout's weights. Disable LFS filters for this
     // source-only historical worktree so git-lfs is not a prerequisite.
@@ -520,7 +613,8 @@ async function main() {
     server = await startServer(new Map([
       ['/current/oidn.js', path.join(projectRoot, 'dist/oidn.js')],
       ['/baseline/oidn.js', path.join(baselineRoot, 'dist/oidn.js')],
-      ['/weights/rt_hdr_calb_cnrm_large.tza', path.join(projectRoot, 'weights/rt_hdr_calb_cnrm_large.tza')]
+      ['/weights/rt_hdr_calb_cnrm_large.tza', path.join(projectRoot, 'weights/rt_hdr_calb_cnrm_large.tza')],
+      ...(inputPath ? [['/input.bin', inputPath]] : [])
     ]));
     browser = await chromium.launch({
       executablePath: chrome,
@@ -531,7 +625,16 @@ async function main() {
       ]
     });
     const variants = [
-      { label: `TFJS (${baselineCommit.slice(0, 7)})`, bundle: 'baseline', baseline: true },
+      options.baseline
+        ? {
+            label: `Reference (${baselineCommit.slice(0, 7)})`,
+            bundle: 'baseline',
+            baseline: true,
+            nativeOptions: true,
+            precision: 'fp16',
+            kernel: 'implicit-gemm'
+          }
+        : { label: `TFJS (${baselineCommit.slice(0, 7)})`, bundle: 'baseline', baseline: true },
       { label: 'WGSL FP32 Auto', bundle: 'current', baseline: false, precision: 'fp32' },
       {
         label: 'WGSL FP32 Direct',
@@ -585,8 +688,10 @@ async function main() {
     for (const result of results) {
       if (!result.baseline && !result.skipped) {
         const comparison = compareSamples(referenceSamples, result.outputSamples);
-        const maxMeanError = result.precision === 'fp16' ? 5e-3 : 1e-4;
-        const maxAbsoluteError = result.precision === 'fp16' ? 5e-2 : 1e-3;
+        const referenceResult = results.find((candidate) => candidate.baseline);
+        const fp16Comparison = result.precision === 'fp16' || referenceResult?.precision === 'fp16';
+        const maxMeanError = fp16Comparison ? 5e-3 : 1e-4;
+        const maxAbsoluteError = fp16Comparison ? 5e-2 : 1e-3;
         const hasComparableOutput =
           Number.isFinite(comparison.meanAbsoluteError) &&
           Number.isFinite(comparison.maxAbsoluteError);
@@ -612,6 +717,9 @@ async function main() {
         tileSize: options.tileSize,
         warmup: options.warmup,
         runs: options.runs,
+        inputHDR: options.inputHDR,
+        inputDimensions: staticHDR ? { width: staticHDR.width, height: staticHDR.height } : null,
+        referenceRuntime: Boolean(options.baseline),
         model: 'rt_hdr_calb_cnrm_large.tza',
         gpuQueueCompletionIncluded: true
       },
