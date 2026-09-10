@@ -1,4 +1,5 @@
 import { Float16Array } from '@petamoriken/float16';
+import { createFinalRgbShader, sharedMemoryBytes as finalRgbSharedMemoryBytes } from './finalRgbShader.js';
 import {
   optimizeModelGraph,
   planModelExecution,
@@ -29,8 +30,12 @@ export type NativeUNetKernelSetting = NativeUNetKernel | 'auto';
 export type NativeUNetGemmWorkgroup = readonly [4 | 8 | 16, 4 | 8];
 
 export interface NativeUNetGemmOptions {
+  /** Internal final-convolution experiments; retains the original FP16 partial order. */
+  finalLayer?: 'direct' | 'shared-input' | 'shared-input-weights' | 'shared-auto';
+  /** Internal load-layout experiments; packed loads preserve the FP16 storage bits. */
+  loadMode?: 'native' | 'packed-weights' | 'packed-all';
   /** Incremental addressing (default), or the original analytic path for A/B comparisons. */
-  addressMode?: 'analytic' | 'incremental';
+  addressMode?: 'analytic' | 'incremental' | 'base-offset';
   /** K-major (default) coalesces neighboring output-block loads; output-major preserves the old ABI. */
   weightLayout?: 'output-major' | 'k-major';
   /** Register tile height (default 8). The K reduction grouping stays fixed. */
@@ -409,6 +414,21 @@ ${accumulator}
 `;
 }
 
+function gemmPackedLoad(
+  precision: NativeUNetPrecision,
+  gemm: Readonly<Required<NativeUNetGemmOptions>>,
+  weights: boolean
+) {
+  return precision === 'fp16' &&
+    (gemm.loadMode === 'packed-all' ||
+      (weights && gemm.loadMode === 'packed-weights'));
+}
+
+// vec2<u32> reinterprets exactly the same eight bytes as vec4<f16>.
+function gemmLoadExpression(expression: string, packed: boolean) {
+  return packed ? `bitcast<vec4<f16>>(${expression})` : expression;
+}
+
 function tiledAccumulationCode(precision: NativeUNetPrecision, gemm: Readonly<Required<NativeUNetGemmOptions>>) {
   const { rowsPerThread, tileNBlocks, tileKBlocks } = gemmTile(gemm);
   if (precision === 'fp16') {
@@ -719,23 +739,31 @@ fn main(
 }
 
 /** Precompute spatial predicates once, then advance the original flattened K order. */
-function tiledAddressCacheCode(inputBlocks: number, decoder: boolean, gemm: Readonly<Required<NativeUNetGemmOptions>>) {
+function tiledAddressCacheCode(inputBlocks: number, decoder: boolean, gemm: Readonly<Required<NativeUNetGemmOptions>>, sources?: { blocks: readonly [number, number]; upsampled: 0 | 1 }) {
   const { workgroupX, workgroupY, tileM, tileKBlocks } = gemmTile(gemm);
   const width = decoder ? 'params.outputWidth' : 'params.inputWidth';
   const height = decoder ? 'params.outputHeight' : 'params.inputHeight';
+  const baseOffset = gemm.addressMode === 'base-offset';
+  // Decoder parity travels in the high mask bits, avoiding extra cached arrays.
+  const baseAssignments = sources
+    ? sources.blocks.map((blocks, source) =>
+        `cachedBase${source}[load] = (${source === sources.upsampled ? 'y / 2u' : 'y'} * params.source${source}Width + ${source === sources.upsampled ? 'x / 2u' : 'x'}) * ${blocks}u;`
+      ).join('\n    ')
+    : `cachedBase0[load] = (y * params.inputWidth + x) * ${inputBlocks}u;`;
   const loads = tileM * tileKBlocks /
     (workgroupX * workgroupY);
   return /* wgsl */ `
-  var cachedX: array<u32, ${loads}>;
-  var cachedY: array<u32, ${loads}>;
+  ${baseOffset ? `var cachedBase0: array<u32, ${loads}>;
+  ${sources ? `var cachedBase1: array<u32, ${loads}>;` : ''}` : `var cachedX: array<u32, ${loads}>;
+  var cachedY: array<u32, ${loads}>;`}
   var cachedMask: array<u32, ${loads}>;
   for (var load = 0u; load < ${loads}u; load++) {
     let loadIndex = localLinear + load * ${workgroupX * workgroupY}u;
     let spatial = workgroupId.x * ${tileM}u + loadIndex / ${tileKBlocks}u;
     let x = spatial % params.outputWidth;
     let y = spatial / params.outputWidth;
-    cachedX[load] = x;
-    cachedY[load] = y;
+    ${baseOffset ? baseAssignments : `cachedX[load] = x;
+    cachedY[load] = y;`}
     let columns =
       select(0u, 0x049u, x > 0u && x - 1u < ${width}) |
       select(0u, 0x092u, x < ${width}) |
@@ -744,7 +772,7 @@ function tiledAddressCacheCode(inputBlocks: number, decoder: boolean, gemm: Read
       select(0u, 0x007u, y > 0u && y - 1u < ${height}) |
       select(0u, 0x038u, y < ${height}) |
       select(0u, 0x1c0u, y + 1u < ${height});
-    cachedMask[load] = select(0u, columns & rows, spatial < spatialCount);
+    cachedMask[load] = select(0u, columns & rows, spatial < spatialCount)${baseOffset && sources ? ' | ((x & 1u) << 9u) | ((y & 1u) << 10u)' : ''};
   }
   var channelBlock = (localLinear % ${tileKBlocks}u) % ${inputBlocks}u;
   var filterPosition = (localLinear % ${tileKBlocks}u) / ${inputBlocks}u;
@@ -774,8 +802,8 @@ function tiledIncrementalInputCode(valueType: string, readValue: string, gemm: R
       let loadIndex = localLinear + load * ${workgroupX * workgroupY}u;
       var value = ${valueType}(0.0);
       if (filterPosition < 9u && (cachedMask[load] & (1u << filterPosition)) != 0u) {
-        let inputX = i32(cachedX[load]) + i32(kernelX) - 1;
-        let inputY = i32(cachedY[load]) + i32(kernelY) - 1;
+        ${gemm.addressMode === 'base-offset' ? '' : `let inputX = i32(cachedX[load]) + i32(kernelX) - 1;
+        let inputY = i32(cachedY[load]) + i32(kernelY) - 1;`}
         ${readValue}
       }
       inputTile[loadIndex] = value;
@@ -800,6 +828,10 @@ function createTiledConvShader(
   const { addressMode, weightLayout } = gemm;
   const inputType = storageVecType(precision);
   const outputType = storageVecType(outputPrecision);
+  const packedInput = gemmPackedLoad(precision, gemm, false);
+  const packedWeights = gemmPackedLoad(precision, gemm, true);
+  const inputStorageType = packedInput ? 'vec2<u32>' : inputType;
+  const weightStorageType = packedWeights ? 'vec2<u32>' : inputType;
   const stored = storeExpression(
     activationExpression('acc', activation),
     outputPrecision
@@ -818,8 +850,8 @@ struct Params {
   inputBlocks: u32,
   outputBlocks: u32,
 }
-@group(0) @binding(0) var<storage, read> inputData: array<${inputType}>;
-@group(0) @binding(1) var<storage, read> weights: array<${inputType}>;
+@group(0) @binding(0) var<storage, read> inputData: array<${inputStorageType}>;
+@group(0) @binding(1) var<storage, read> weights: array<${weightStorageType}>;
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> outputData: array<${outputType}>;
 @group(0) @binding(4) var<uniform> params: Params;
@@ -847,13 +879,14 @@ fn main(
 
   let localLinear =
     localId.y * ${workgroupX}u + localId.x;
-  ${addressMode === 'incremental' ? tiledAddressCacheCode(inputBlocks, false, gemm) : ''}
+  ${addressMode !== 'analytic' ? tiledAddressCacheCode(inputBlocks, false, gemm) : ''}
   let totalK = ${inputBlocks * 9}u;
   for (var kBase = 0u; kBase < totalK; kBase += ${tileKBlocks}u) {
-    ${addressMode === 'incremental' ? tiledIncrementalInputCode(inputType, `
-        let inputIndex = (u32(inputY) * params.inputWidth + u32(inputX)) *
-          ${inputBlocks}u + inputBlock;
-        value = inputData[inputIndex];
+    ${addressMode !== 'analytic' ? tiledIncrementalInputCode(inputType, `
+        ${addressMode === 'base-offset' ? `let offset = (i32(kernelY) - 1) * i32(params.inputWidth) + i32(kernelX) - 1;
+        let inputIndex = cachedBase0[load] + u32(offset * ${inputBlocks}) + inputBlock;` : `let inputIndex = (u32(inputY) * params.inputWidth + u32(inputX)) *
+          ${inputBlocks}u + inputBlock;`}
+        value = ${gemmLoadExpression('inputData[inputIndex]', packedInput)};
     `, gemm) : /* wgsl */ `
     for (
       var loadIndex = localLinear;
@@ -882,7 +915,7 @@ fn main(
           let inputIndex =
             (u32(inputY) * params.inputWidth + u32(inputX)) *
             ${inputBlocks}u + inputBlock;
-          value = inputData[inputIndex];
+          value = ${gemmLoadExpression('inputData[inputIndex]', packedInput)};
         }
       }
       inputTile[loadIndex] = value;
@@ -905,7 +938,7 @@ fn main(
       if (loadedOutputBlock < ${outputBlocks}u && kIndex < totalK) {
         ${weightLayout === 'k-major' ? /* wgsl */ `
         let weightIndex = (kIndex * ${outputBlocks}u + loadedOutputBlock) * 4u + outputLane;
-        ` : addressMode === 'incremental' ? /* wgsl */ `
+        ` : addressMode !== 'analytic' ? /* wgsl */ `
         let weightIndex = (loadedOutputBlock * ${inputBlocks * 9}u + kIndex) * 4u + outputLane;
         ` : /* wgsl */ `
         let inputBlock = kIndex % ${inputBlocks}u;
@@ -916,7 +949,7 @@ fn main(
           ((((loadedOutputBlock * 3u + kernelY) * 3u + kernelX) *
             ${inputBlocks}u + inputBlock) * 4u + outputLane);
         `}
-        value = weights[weightIndex];
+        value = ${gemmLoadExpression('weights[weightIndex]', packedWeights)};
       }
       weightTile[loadIndex] = value;
     }
@@ -924,7 +957,7 @@ fn main(
     workgroupBarrier();
     ${tiledAccumulationCode(precision, gemm)}
     workgroupBarrier();
-    ${addressMode === 'incremental' ? tiledAddressAdvanceCode(inputBlocks, gemm) : ''}
+    ${addressMode !== 'analytic' ? tiledAddressAdvanceCode(inputBlocks, gemm) : ''}
   }
 
   if (outputBlock < ${outputBlocks}u) {
@@ -1059,6 +1092,10 @@ function createTiledDecoderShader(
   const { addressMode, weightLayout } = gemm;
   const valueType = storageVecType(precision);
   const outputType = storageVecType(outputPrecision);
+  const packedInput = gemmPackedLoad(precision, gemm, false);
+  const packedWeights = gemmPackedLoad(precision, gemm, true);
+  const inputStorageType = packedInput ? 'vec2<u32>' : valueType;
+  const weightStorageType = packedWeights ? 'vec2<u32>' : valueType;
   const inputBlocks = sourceBlocks[0] + sourceBlocks[1];
   const stored = storeExpression(
     activationExpression('acc[row]', activation),
@@ -1081,12 +1118,15 @@ function createTiledDecoderShader(
     return /* wgsl */ `
           {
             let sourceBlock = ${blockExpression};
-            let sourceX = ${sourceX};
+            ${addressMode === 'base-offset' ? `let dx = ${source === upsampledSource ? '(i32((cachedMask[load] >> 9u) & 1u) + i32(kernelX) - 1) >> 1u' : 'i32(kernelX) - 1'};
+            let dy = ${source === upsampledSource ? '(i32((cachedMask[load] >> 10u) & 1u) + i32(kernelY) - 1) >> 1u' : 'i32(kernelY) - 1'};
+            let offset = (dy * i32(params.source${source}Width) + dx) * ${sourceBlocks[source]};
+            let sourceIndex = cachedBase${source}[load] + u32(offset) + sourceBlock;` : `let sourceX = ${sourceX};
             let sourceY = ${sourceY};
             let sourceIndex =
               (sourceY * params.source${source}Width + sourceX) *
-              ${sourceBlocks[source]}u + sourceBlock;
-            value = input${source}[sourceIndex];
+              ${sourceBlocks[source]}u + sourceBlock;` }
+            value = ${gemmLoadExpression(`input${source}[sourceIndex]`, packedInput)};
           }`;
   };
   return /* wgsl */ `${shaderPreamble(precision)}
@@ -1100,9 +1140,9 @@ struct Params {
   source1Width: u32,
   source1Height: u32,
 }
-@group(0) @binding(0) var<storage, read> input0: array<${valueType}>;
-@group(0) @binding(1) var<storage, read> input1: array<${valueType}>;
-@group(0) @binding(2) var<storage, read> weights: array<${valueType}>;
+@group(0) @binding(0) var<storage, read> input0: array<${inputStorageType}>;
+@group(0) @binding(1) var<storage, read> input1: array<${inputStorageType}>;
+@group(0) @binding(2) var<storage, read> weights: array<${weightStorageType}>;
 @group(0) @binding(3) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> outputData: array<${outputType}>;
 @group(0) @binding(5) var<uniform> params: Params;
@@ -1130,10 +1170,10 @@ fn main(
 
   let localLinear =
     localId.y * ${workgroupX}u + localId.x;
-  ${addressMode === 'incremental' ? tiledAddressCacheCode(inputBlocks, true, gemm) : ''}
+  ${addressMode !== 'analytic' ? tiledAddressCacheCode(inputBlocks, true, gemm, { blocks: sourceBlocks, upsampled: upsampledSource }) : ''}
   let totalK = ${inputBlocks * 9}u;
   for (var kBase = 0u; kBase < totalK; kBase += ${tileKBlocks}u) {
-    ${addressMode === 'incremental' ? tiledIncrementalInputCode(valueType, `
+    ${addressMode !== 'analytic' ? tiledIncrementalInputCode(valueType, `
         if (inputBlock < ${sourceBlocks[0]}u) {
           ${sourceRead(0, 'inputBlock')}
         } else {
@@ -1191,7 +1231,7 @@ fn main(
       if (loadedOutputBlock < ${outputBlocks}u && kIndex < totalK) {
         ${weightLayout === 'k-major' ? /* wgsl */ `
         let weightIndex = (kIndex * ${outputBlocks}u + loadedOutputBlock) * 4u + outputLane;
-        ` : addressMode === 'incremental' ? /* wgsl */ `
+        ` : addressMode !== 'analytic' ? /* wgsl */ `
         let weightIndex = (loadedOutputBlock * ${inputBlocks * 9}u + kIndex) * 4u + outputLane;
         ` : /* wgsl */ `
         let inputBlock = kIndex % ${inputBlocks}u;
@@ -1202,7 +1242,7 @@ fn main(
           ((((loadedOutputBlock * 3u + kernelY) * 3u + kernelX) *
             ${inputBlocks}u + inputBlock) * 4u + outputLane);
         `}
-        value = weights[weightIndex];
+        value = ${gemmLoadExpression('weights[weightIndex]', packedWeights)};
       }
       weightTile[loadIndex] = value;
     }
@@ -1210,7 +1250,7 @@ fn main(
     workgroupBarrier();
     ${tiledAccumulationCode(precision, gemm)}
     workgroupBarrier();
-    ${addressMode === 'incremental' ? tiledAddressAdvanceCode(inputBlocks, gemm) : ''}
+    ${addressMode !== 'analytic' ? tiledAddressAdvanceCode(inputBlocks, gemm) : ''}
   }
 
   if (outputBlock < ${outputBlocks}u) {
@@ -1529,12 +1569,20 @@ export class NativeUNetExecutor {
     this.kernelSetting = options.kernel ?? 'auto';
     const workgroupSize = options.gemm?.workgroupSize ?? [8, 8];
     this.gemm = Object.freeze({
+      finalLayer: options.gemm?.finalLayer ?? 'shared-auto',
+      loadMode: options.gemm?.loadMode ?? 'native',
       addressMode: options.gemm?.addressMode ?? 'incremental',
       weightLayout: options.gemm?.weightLayout ?? 'k-major',
       rowsPerThread: options.gemm?.rowsPerThread ?? 8,
       workgroupSize: Object.freeze([workgroupSize[0], workgroupSize[1]]) as NativeUNetGemmWorkgroup
     });
-    if (!['analytic', 'incremental'].includes(this.gemm.addressMode)) {
+    if (!['direct', 'shared-input', 'shared-input-weights', 'shared-auto'].includes(this.gemm.finalLayer)) {
+      throw new Error(`Unsupported GEMM final layer: ${this.gemm.finalLayer}`);
+    }
+    if (!['native', 'packed-weights', 'packed-all'].includes(this.gemm.loadMode)) {
+      throw new Error(`Unsupported GEMM load mode: ${this.gemm.loadMode}`);
+    }
+    if (!['analytic', 'incremental', 'base-offset'].includes(this.gemm.addressMode)) {
       throw new Error(`Unsupported GEMM address mode: ${this.gemm.addressMode}`);
     }
     if (!['output-major', 'k-major'].includes(this.gemm.weightLayout)) {
@@ -1690,13 +1738,33 @@ export class NativeUNetExecutor {
         this._model.convChannels.get(node.id)!.outputChannels
       );
       const kernel = this._selectConvKernel(inputBlocks, isFinal);
+      const cacheFinalWeights = this.gemm.finalLayer === 'shared-input-weights' ||
+        (this.gemm.finalLayer === 'shared-auto' &&
+          finalRgbSharedMemoryBytes(this.precision, inputBlocks, true) <=
+            this._device.limits.maxComputeWorkgroupStorageSize);
+      if (
+        isFinal && this._model.convChannels.get(node.id)!.outputChannels === 3 &&
+        (this.kernelSetting === 'auto' || this.kernelSetting === 'implicit-gemm') &&
+        this.gemm.finalLayer !== 'direct' &&
+        this._device.limits.maxComputeWorkgroupSizeX >= 8 &&
+        this._device.limits.maxComputeWorkgroupSizeY >= 8 &&
+        this._device.limits.maxComputeInvocationsPerWorkgroup >= 64 &&
+        finalRgbSharedMemoryBytes(this.precision, inputBlocks, cacheFinalWeights) <=
+          this._device.limits.maxComputeWorkgroupStorageSize
+      ) {
+        return {
+          key: `conv-final-rgb/${this.precision}/${node.activation}/in${inputBlocks}/weights-${cacheFinalWeights ? 'shared' : 'storage'}`,
+          kernel: 'direct',
+          code: createFinalRgbShader(this.precision, node.activation, inputBlocks, cacheFinalWeights)
+        };
+      }
       const key =
         `conv-${kernel}/${this.precision}/` +
         `${outputPrecision}/${node.activation}/` +
         `in${inputBlocks}/out${outputBlocks}` +
         (kernel === 'implicit-gemm'
           ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}`
+            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}`
           : '');
       return {
         key,
@@ -1795,7 +1863,7 @@ export class NativeUNetExecutor {
         `${sourceBlocks.join('+')}/out${outputBlocks}/up${upsampledSource}` +
         (kernel === 'implicit-gemm'
           ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}`
+            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}`
           : '');
       return {
         key,

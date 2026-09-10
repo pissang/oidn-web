@@ -151,6 +151,28 @@ function fusedFinalModel(dataType = 'Float16') {
   return validateUNetModel(tensors, spec);
 }
 
+function wideFinalModel(dataType = 'Float16') {
+  const spec = {
+    schemaVersion: 1,
+    id: 'native-gemm-wide-final-test',
+    family: 'native-gemm-wide-final-test',
+    input: 'input',
+    output: 'output',
+    receptiveField: 3,
+    nodes: [
+      { op: 'conv2d', id: 'hidden', input: 'input', weight: 'hidden.weight', bias: 'hidden.bias', activation: 'relu', padding: 'same' },
+      { op: 'conv2d', id: 'output', input: 'hidden', weight: 'output.weight', bias: 'output.bias', activation: 'identity', padding: 'same' }
+    ]
+  };
+  const tensors = new Map([
+    ['hidden.weight', tensor([32, 3, 3, 3], 'oihw', dataType, Array(32 * 3 * 3 * 3).fill(0))],
+    ['hidden.bias', tensor([32], 'x', dataType, Array(32).fill(1))],
+    ['output.weight', tensor([3, 32, 3, 3], 'oihw', dataType, Array(3 * 32 * 3 * 3).fill(0))],
+    ['output.bias', tensor([3], 'x', dataType, [1, 2, 3])]
+  ]);
+  return validateUNetModel(tensors, spec);
+}
+
 function tensor(dims, layout, dataType, values) {
   const desc = new TensorDesc();
   desc.dims = [...dims];
@@ -310,6 +332,8 @@ test('freezes normalized GEMM configuration without mutating caller input', asyn
       { precision: 'fp32', kernel: 'implicit-gemm', gemm: input }
     );
     assert.deepEqual(executor.gemm, {
+      finalLayer: 'shared-auto',
+      loadMode: 'native',
       addressMode: 'incremental',
       weightLayout: 'k-major',
       rowsPerThread: 2,
@@ -336,6 +360,8 @@ test('rejects unsupported GEMM address, layout, register, workgroup, and storage
     const model = testModel('Float32').model;
     for (const gemm of [
       { addressMode: 'bad' },
+      { loadMode: 'bad' },
+      { finalLayer: 'bad' },
       { weightLayout: 'bad' },
       { rowsPerThread: 3 },
       { workgroupSize: [2, 8] },
@@ -377,6 +403,7 @@ test('pipeline cache ABI separates address, weight layout, and tile variants', a
       model,
       executorOptions('fp32', 'k-major', {
         addressMode: 'incremental',
+        loadMode: 'packed-all',
         rowsPerThread: 2,
         workgroupSize: [4, 8]
       })
@@ -384,10 +411,122 @@ test('pipeline cache ABI separates address, weight layout, and tile variants', a
     await kMajor.prepare();
     const secondLabels = device.pipelineLabels.slice(firstLabels.length);
     assert.ok(firstLabels.some((label) => label.includes('address-analytic/weights-output-major-v1/tile-8x8-r4')));
-    assert.ok(secondLabels.some((label) => label.includes('address-incremental/weights-k-major-v1/tile-4x8-r2')));
+    assert.ok(secondLabels.some((label) => label.includes('address-incremental/weights-k-major-v1/tile-4x8-r2/loads-packed-all')));
     assert.notDeepEqual(firstLabels, secondLabels);
     analytic.dispose();
     kMajor.dispose();
+  });
+});
+
+test('selects final shared-load variants and falls back when the halo exceeds shared memory', async () => {
+  await withGpuUsage(async () => {
+    const model = testModel('Float16').model;
+    const device = fakeDevice();
+    const sharedInput = new NativeUNetExecutor(
+      device,
+      model,
+      executorOptions('fp16', 'k-major', { finalLayer: 'shared-input' })
+    );
+    await sharedInput.prepare();
+    const firstLabels = [...device.pipelineLabels];
+    assert.ok(firstLabels.some((label) =>
+      label.includes('conv-final-rgb/fp16/identity/in2/weights-storage')
+    ));
+
+    const sharedWeights = new NativeUNetExecutor(
+      device,
+      model,
+      executorOptions('fp16', 'k-major', { finalLayer: 'shared-input-weights' })
+    );
+    await sharedWeights.prepare();
+    const secondLabels = device.pipelineLabels.slice(firstLabels.length);
+    assert.ok(secondLabels.some((label) =>
+      label.includes('conv-final-rgb/fp16/identity/in2/weights-shared')
+    ));
+    assert.notDeepEqual(firstLabels, secondLabels);
+
+    const fallback = new NativeUNetExecutor(
+      fakeDevice({ maxComputeWorkgroupStorageSize: 4096 }),
+      wideFinalModel(),
+      executorOptions('fp16', 'k-major', { finalLayer: 'shared-input' })
+    );
+    await fallback.prepare();
+    assert.ok(fallback._pipelineCache instanceof Map);
+    assert.ok([...fallback._pipelineCache.keys()].some((key) =>
+      key.includes('conv-direct/fp16/fp32/identity/in8/out1')
+    ));
+    assert.ok(![...fallback._pipelineCache.keys()].some((key) =>
+      key.includes('conv-final-rgb/')
+    ));
+    sharedInput.dispose();
+    sharedWeights.dispose();
+    fallback.dispose();
+  });
+});
+
+test('shared-auto chooses weight cache, input-only cache, then direct fallback by limit', async () => {
+  await withGpuUsage(async () => {
+    const cases = [
+      [32768, 'weights-shared'],
+      [8192, 'weights-storage']
+    ];
+    for (const [storageLimit, weightMode] of cases) {
+      const device = fakeDevice({ maxComputeWorkgroupStorageSize: storageLimit });
+      const executor = new NativeUNetExecutor(
+        device,
+        wideFinalModel(),
+        executorOptions('fp16', 'k-major', { finalLayer: 'shared-auto' })
+      );
+      await executor.prepare();
+      assert.ok(device.pipelineLabels.some((label) =>
+        label.includes(`conv-final-rgb/fp16/identity/in8/${weightMode}`)
+      ));
+      executor.dispose();
+    }
+
+    const fallbackDevice = fakeDevice({ maxComputeWorkgroupStorageSize: 4096 });
+    const fallback = new NativeUNetExecutor(
+      fallbackDevice,
+      wideFinalModel(),
+      executorOptions('fp16', 'k-major', { finalLayer: 'shared-auto' })
+    );
+    await fallback.prepare();
+    assert.ok(fallbackDevice.pipelineLabels.some((label) =>
+      label.includes('conv-direct/fp16/fp32/identity/in8/out1')
+    ));
+    assert.ok(!fallbackDevice.pipelineLabels.some((label) =>
+      label.includes('conv-final-rgb/')
+    ));
+    fallback.dispose();
+  });
+});
+
+test('explicit direct kernel ignores final-layer and GEMM load tuning flags', async () => {
+  await withGpuUsage(async () => {
+    const device = fakeDevice();
+    const executor = new NativeUNetExecutor(
+      device,
+      testModel('Float16').model,
+      {
+        precision: 'fp16',
+        kernel: 'direct',
+        gemm: {
+          finalLayer: 'shared-input-weights',
+          loadMode: 'packed-all',
+          addressMode: 'base-offset',
+          weightLayout: 'k-major',
+          rowsPerThread: 2,
+          workgroupSize: [4, 8]
+        }
+      }
+    );
+    await executor.prepare();
+    assert.ok(device.pipelineLabels.some((label) =>
+      label.includes('conv-direct/fp16/fp32/identity/in2/out1')
+    ));
+    assert.ok(!device.pipelineLabels.some((label) => label.includes('conv-final-rgb/')));
+    assert.equal(executor._packedConvs.get('output').weightLayout, 'output-major');
+    executor.dispose();
   });
 });
 
