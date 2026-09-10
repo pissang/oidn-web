@@ -15,9 +15,9 @@ The OIDN U-Net runs directly on WebGPU with model-driven WGSL compute
 pipelines. Convolution activations use a blocked
 four-channel layout, decoder `upsample + concat + conv` patterns are fused,
 and all network dispatches for a tile are submitted in one command buffer.
-FP32 convolutions use channel-specialized implicit-GEMM tiles; FP16 uses
-channel-specialized vector FMA and separate max-pool passes, selected from the
-same model descriptor.
+FP16 and FP32 convolutions use channel-specialized implicit-GEMM tiles by
+default, with a direct convolution for the final output layer and separate
+max-pool passes. Set `kernel: 'direct'` to use the vector-FMA convolution path.
 
 TZA half-float weights stay half-float when the device enables `shader-f16`.
 FP16 products are accumulated in short half-precision groups and periodically
