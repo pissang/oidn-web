@@ -22,6 +22,7 @@ Options:
   --warmup <n>         Warmup executions per runtime (default: 1)
   --runs <n>           Measured executions per runtime (default: 5)
   --input-hdr <path>   Use a static Radiance HDR as the color input
+  --default-only       Benchmark only the current runtime's default config
   --baseline <commit>  Reference commit (default: nearest TFJS ancestor)
   --chrome <path>      Chrome/Chromium executable
   --output <path>      JSON output (default: benchmarks/results/latest.json)
@@ -37,6 +38,7 @@ function parseArgs(argv) {
     warmup: 1,
     runs: 5,
     inputHDR: null,
+    defaultOnly: false,
     output: path.join(benchmarkDirectory, 'results/latest.json')
   };
   const names = {
@@ -52,6 +54,10 @@ function parseArgs(argv) {
   };
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
+    if (argument === '--default-only') {
+      options.defaultOnly = true;
+      continue;
+    }
     if (argument === '--help' || argument === '-h') {
       options.help = true;
       continue;
@@ -313,7 +319,10 @@ async function benchmarkVariant(browser, origin, options, variant) {
       if (config.precision === 'fp16' && !supportsFP16) {
         return { skipped: 'shader-f16 is unavailable' };
       }
-      const requiredFeatures = config.precision === 'fp16' ? ['shader-f16'] : [];
+      const requiredFeatures =
+        (config.precision === 'fp16' || config.precision === 'auto') && supportsFP16
+          ? ['shader-f16']
+          : [];
       if (config.kernel === 'subgroup') {
         if (!adapter.features.has('subgroups')) {
           return { skipped: 'subgroups is unavailable' };
@@ -341,7 +350,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
         maxTileSize: config.tileSize
       };
       if (!config.baseline || config.nativeOptions) {
-        runtimeOptions.engine = config.engine ?? 'wgsl';
+        runtimeOptions.engine = config.engine ?? 'auto';
         runtimeOptions.precision = config.precision;
         runtimeOptions.kernel = config.kernel;
         runtimeOptions.dynamicTile = false;
@@ -526,11 +535,13 @@ function markdownReport(report) {
   const baselineKind = report.settings.referenceRuntime ? 'reference runtime' : 'TFJS';
   const rows = report.results.map((result) => {
     if (result.skipped) return `| ${result.label} | skipped | - | - | - | ${result.skipped} |`;
-    const speedup = baselineMedian / result.summary.medianMs;
-    return `| ${result.label} | ${formatNumber(result.initializationMs)} | ${formatNumber(result.summary.medianMs)} | ${formatNumber(result.summary.p95Ms)} | ${speedup.toFixed(2)}x | ${result.runtimeInfo?.precision ?? 'fp32'} |`;
+    const speedup = baselineMedian == null
+      ? null
+      : baselineMedian / result.summary.medianMs;
+    return `| ${result.label} | ${formatNumber(result.initializationMs)} | ${formatNumber(result.summary.medianMs)} | ${formatNumber(result.summary.p95Ms)} | ${speedup == null ? '-' : `${speedup.toFixed(2)}x`} | ${result.runtimeInfo?.precision ?? 'fp32'} |`;
   });
   const validationRows = report.results
-    .filter((result) => !result.baseline && !result.skipped)
+    .filter((result) => !result.baseline && !result.skipped && result.validation)
     .map((result) => {
       const validation = result.validation;
       const status = validation.passed ? 'pass' : 'FAIL';
@@ -550,13 +561,17 @@ function markdownReport(report) {
     });
   return `# oidn-web benchmark\n\n` +
     `- Current: \`${report.currentCommit}\`\n` +
-    `- ${baselineKind[0].toUpperCase()}${baselineKind.slice(1)} baseline: \`${report.baselineCommit}\`\n` +
+    (report.baselineCommit
+      ? `- ${baselineKind[0].toUpperCase()}${baselineKind.slice(1)} baseline: \`${report.baselineCommit}\`\n`
+      : '- Baseline: none (current default configuration only)\n') +
     `- Input: ${report.settings.width}x${report.settings.height}, fixed tile ${report.settings.tileSize}, ${report.settings.runs} runs after ${report.settings.warmup} warmup(s)\n` +
     `- Adapter: ${report.adapter.description || report.adapter.device || report.adapter.vendor || 'unknown'}\n\n` +
     `| Runtime | Init ms | Median ms | P95 ms | Speedup | Precision |\n` +
     `| --- | ---: | ---: | ---: | ---: | --- |\n${rows.join('\n')}\n\n` +
     `## Output validation\n\n` +
-    `Compared against sampled ${baselineKind} output.\n\n` +
+    (report.baselineCommit
+      ? `Compared against sampled ${baselineKind} output.\n\n`
+      : 'No cross-runtime output comparison was requested.\n\n') +
     `| Runtime | Status | MAE | RMSE | Max error | Samples |\n` +
     `| --- | --- | ---: | ---: | ---: | ---: |\n${validationRows.join('\n')}\n\n` +
     `## GPU hot layers\n\n${profileSections.join('\n\n') || 'Timestamp queries unavailable.'}\n`;
@@ -570,9 +585,15 @@ async function main() {
   }
   const chrome = options.chrome || defaultChrome();
   if (!chrome) throw new Error('Chrome/Chromium not found; pass --chrome or CHROME_PATH');
-  const baselineCommit = await findTFJSBaseline(options.baseline);
+  const baselineCommit = options.defaultOnly
+    ? null
+    : await findTFJSBaseline(options.baseline);
   const currentCommit = await gitText(['rev-parse', 'HEAD']);
-  console.log(`${options.baseline ? 'Reference' : 'TFJS'} baseline: ${baselineCommit.slice(0, 12)}`);
+  if (baselineCommit) {
+    console.log(`${options.baseline ? 'Reference' : 'TFJS'} baseline: ${baselineCommit.slice(0, 12)}`);
+  } else {
+    console.log('Default-only benchmark: no baseline or A/B variants');
+  }
   console.log(`Current runtime: ${currentCommit.slice(0, 12)} + working tree`);
 
   await run('npm', ['run', 'build']);
@@ -599,23 +620,26 @@ async function main() {
     // The repository stores model files through Git LFS, but the benchmark
     // serves the current checkout's weights. Disable LFS filters for this
     // source-only historical worktree so git-lfs is not a prerequisite.
-    await run('git', [
-      '-c', 'filter.lfs.smudge=',
-      '-c', 'filter.lfs.process=',
-      '-c', 'filter.lfs.required=false',
-      '-c', 'core.hooksPath=/dev/null',
-      'worktree', 'add', '--detach', baselineRoot, baselineCommit
-    ]);
-    worktreeAdded = true;
-    await run('npm', ['ci', '--ignore-scripts'], { cwd: baselineRoot });
-    await run('npm', ['run', 'build'], { cwd: baselineRoot });
+    if (baselineCommit) {
+      await run('git', [
+        '-c', 'filter.lfs.smudge=',
+        '-c', 'filter.lfs.process=',
+        '-c', 'filter.lfs.required=false',
+        '-c', 'core.hooksPath=/dev/null',
+        'worktree', 'add', '--detach', baselineRoot, baselineCommit
+      ]);
+      worktreeAdded = true;
+      await run('npm', ['ci', '--ignore-scripts'], { cwd: baselineRoot });
+      await run('npm', ['run', 'build'], { cwd: baselineRoot });
+    }
 
-    server = await startServer(new Map([
+    const serverFiles = [
       ['/current/oidn.js', path.join(projectRoot, 'dist/oidn.js')],
-      ['/baseline/oidn.js', path.join(baselineRoot, 'dist/oidn.js')],
-      ['/weights/rt_hdr_calb_cnrm_large.tza', path.join(projectRoot, 'weights/rt_hdr_calb_cnrm_large.tza')],
-      ...(inputPath ? [['/input.bin', inputPath]] : [])
-    ]));
+      ['/weights/rt_hdr_calb_cnrm_large.tza', path.join(projectRoot, 'weights/rt_hdr_calb_cnrm_large.tza')]
+    ];
+    if (baselineCommit) serverFiles.push(['/baseline/oidn.js', path.join(baselineRoot, 'dist/oidn.js')]);
+    if (inputPath) serverFiles.push(['/input.bin', inputPath]);
+    server = await startServer(new Map(serverFiles));
     browser = await chromium.launch({
       executablePath: chrome,
       headless: true,
@@ -624,7 +648,18 @@ async function main() {
         '--enable-features=Vulkan,UseSkiaRenderer,WebMachineLearningNeuralNetwork'
       ]
     });
-    const variants = [
+    const variants = options.defaultOnly
+      ? [
+          {
+            label: 'Current default (auto)',
+            bundle: 'current',
+            baseline: false,
+            nativeOptions: true,
+            engine: 'auto',
+            precision: 'auto'
+          }
+        ]
+      : [
       options.baseline
         ? {
             label: `Reference (${baselineCommit.slice(0, 7)})`,
@@ -678,7 +713,7 @@ async function main() {
         precision: 'fp16',
         engine: 'webnn'
       }
-    ];
+        ];
     const results = [];
     for (const variant of variants) {
       console.log(`Benchmarking ${variant.label}...`);
@@ -686,7 +721,7 @@ async function main() {
     }
     const referenceSamples = results.find((result) => result.baseline)?.outputSamples;
     for (const result of results) {
-      if (!result.baseline && !result.skipped) {
+      if (!result.baseline && !result.skipped && referenceSamples) {
         const comparison = compareSamples(referenceSamples, result.outputSamples);
         const referenceResult = results.find((candidate) => candidate.baseline);
         const fp16Comparison = result.precision === 'fp16' || referenceResult?.precision === 'fp16';
@@ -719,6 +754,7 @@ async function main() {
         runs: options.runs,
         inputHDR: options.inputHDR,
         inputDimensions: staticHDR ? { width: staticHDR.width, height: staticHDR.height } : null,
+        defaultOnly: options.defaultOnly,
         referenceRuntime: Boolean(options.baseline),
         model: 'rt_hdr_calb_cnrm_large.tza',
         gpuQueueCompletionIncluded: true
