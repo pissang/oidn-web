@@ -9,7 +9,8 @@ import {
 import {
   DynamicTileController,
   type DynamicTileSetting,
-  fitTileDimension,
+  planTileGrid,
+  type PlannedTile,
   OIDN_TILE_ALIGNMENT,
   waitForSubmittedGPUWork
 } from './tileScheduler';
@@ -48,9 +49,16 @@ interface GPUImageDataOutput {
 export interface UNetExecutionStats {
   width: number;
   height: number;
+  /** Largest output region width retained for backward compatibility. */
   tileWidth: number;
+  /** Largest output region height retained for backward compatibility. */
   tileHeight: number;
   tileCount: number;
+  tileColumns: number;
+  tileRows: number;
+  tileOverlap: number;
+  inputPixelCount: number;
+  inputShapeCount: number;
   durationMs: number;
   tileTimeMs: {
     min: number;
@@ -72,14 +80,6 @@ function isGPUImageData(
 
 class UNet {
   private _device: GPUDevice | undefined;
-
-  // TODO calculate the tile size from memory size
-  // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/unet_filter.cpp#L287
-  private _tileWidth = 0;
-  private _tileHeight = 0;
-
-  private _tileOverlapX = 0;
-  private _tileOverlapY = 0;
 
   private _aux;
   private _hdr;
@@ -182,6 +182,38 @@ class UNet {
     await this._nativeExecutor!.prepare();
   }
 
+  /**
+   * Prepares the input shapes selected for an image before its first denoise.
+   * Hosts can call this while they still display their model-loading state.
+   */
+  async prepareForImage(
+    width: number,
+    height: number,
+    options: { tileOverlap?: number } = {}
+  ) {
+    const defaultTileOverlap = roundUp(
+      this._modelSpec.receptiveField / 2,
+      OIDN_TILE_ALIGNMENT
+    );
+    const resolvedTileOverlap = options.tileOverlap === undefined
+      ? defaultTileOverlap
+      : roundUp(Math.max(0, options.tileOverlap), OIDN_TILE_ALIGNMENT);
+    const plan = planTileGrid(
+      width,
+      height,
+      this._dynamicTileController.tileSize,
+      resolvedTileOverlap
+    );
+    const shapes = [...new Map(
+      plan.tiles.map(({ input }) => [
+        `${input.width}x${input.height}`,
+        { width: input.width, height: input.height }
+      ])
+    ).values()];
+    await this._webNNExecutor?.prewarm(shapes);
+    this._nativeExecutor?.prewarm(shapes);
+  }
+
   getRuntimeInfo() {
     return {
       configuredEngine: this._engine,
@@ -219,54 +251,6 @@ class UNet {
 
   getLastExecutionProfile() {
     return this._nativeExecutor?.getLastExecutionProfile();
-  }
-
-  private _updateModel(width: number, height: number) {
-    const maxTileSize = this._dynamicTileController.tileSize;
-
-    let tileWidth = fitTileDimension(width, maxTileSize);
-    let tileHeight = fitTileDimension(height, maxTileSize);
-    const defaultTileOverlap = roundUp(
-      this._modelSpec.receptiveField / 2,
-      OIDN_TILE_ALIGNMENT
-    );
-    let tileOverlapX = defaultTileOverlap;
-    let tileOverlapY = defaultTileOverlap;
-
-    if (width <= maxTileSize) {
-      tileOverlapX = 0;
-    }
-    if (height <= maxTileSize) {
-      tileOverlapY = 0;
-    }
-
-    // Force width and height has same size. reduce the cache in memory
-    const tileSize = Math.max(tileWidth, tileHeight);
-    const tileOverlap = Math.max(tileOverlapX, tileOverlapY);
-    tileWidth = tileSize;
-    tileHeight = tileSize;
-    tileOverlapX = tileOverlap;
-    tileOverlapY = tileOverlap;
-
-    if (
-      tileWidth !== this._tileWidth ||
-      tileHeight !== this._tileHeight ||
-      tileOverlapX !== this._tileOverlapX ||
-      tileOverlapY !== this._tileOverlapY
-    ) {
-      // console.log(tileWidth, tileHeight, tileOverlapX, tileOverlapY);
-      this._tileWidth = tileWidth;
-      this._tileHeight = tileHeight;
-      this._tileOverlapX = tileOverlapX;
-      this._tileOverlapY = tileOverlapY;
-    }
-  }
-
-  private _getTileSizeWithOverlap() {
-    return {
-      width: this._tileWidth + 2 * this._tileOverlapX,
-      height: this._tileHeight + 2 * this._tileOverlapY
-    };
   }
 
   private _processImageData(
@@ -381,31 +365,28 @@ class UNet {
         },
     outputTileData: ImageData | HDRImageData | undefined,
     outputImageData: ImageData | HDRImageData | undefined,
-    i: number,
-    j: number,
+    tile: PlannedTile,
+    isFirstTile: boolean,
     width: number,
     height: number,
     isHDR: boolean,
     denoiseAlpha?: boolean
   ) {
     const channels = this._aux ? 9 : 3;
-    const tileOverlapX = this._tileOverlapX;
-    const tileOverlapY = this._tileOverlapY;
-    let srcTileSize = this._getTileSizeWithOverlap();
-    let dstTileSize = { width: this._tileWidth, height: this._tileHeight };
-
-    let srcX0 = i > 0 ? i * dstTileSize.width - tileOverlapX : 0;
-    let srcX1 = Math.min(srcX0 + srcTileSize.width, width);
-    srcX0 = Math.max(srcX1 - srcTileSize.width, 0);
-
-    let srcY0 = j > 0 ? j * dstTileSize.height - tileOverlapY : 0;
-    let srcY1 = Math.min(srcY0 + srcTileSize.height, height);
-    srcY0 = Math.max(srcY1 - srcTileSize.height, 0);
-
-    const srcTileWidth = srcTileSize.width;
-    const srcTileHeight = srcTileSize.height;
-
-    const srcTile = new Tile(srcX0, srcY0, srcTileWidth, srcTileHeight);
+    const srcTile = new Tile(
+      tile.input.x,
+      tile.input.y,
+      tile.input.width,
+      tile.input.height
+    );
+    const dstTile = new Tile(
+      tile.output.x,
+      tile.output.y,
+      tile.output.width,
+      tile.output.height
+    );
+    const srcTileWidth = srcTile.width;
+    const srcTileHeight = srcTile.height;
 
     let nativeOutputBuffer: GPUBuffer | undefined;
     let denoisedData: Float32Array | undefined;
@@ -441,7 +422,7 @@ class UNet {
       dataProcessGPU.setImageSize(width, height);
       dataProcessGPU.setInputTile(srcTile);
       // Display the noisy input instead of prev denoised result
-      if (i === 0 && j === 0) {
+      if (isFirstTile) {
         dataProcessGPU.copyInputDataToOutput(inputData.color);
       }
       const { color, albedo, normal } = dataProcessGPU.forward(
@@ -460,12 +441,6 @@ class UNet {
 
     let outBuffer: GPUBuffer;
 
-    const dstWidth = Math.min(dstTileSize.width, width);
-    const dstHeight = Math.min(dstTileSize.height, height);
-    const dstTile = new Tile(i * dstWidth, j * dstHeight, dstWidth, dstHeight);
-    dstTile.width = Math.min(dstTile.width, width - dstTile.x);
-    dstTile.height = Math.min(dstTile.height, height - dstTile.y);
-
     if (inputData instanceof Float32Array) {
       if (isHDR) {
         denoisedData = hdrTransferFuncInverseCPU({
@@ -480,13 +455,13 @@ class UNet {
         srcTile,
         dstTile,
         denoisedData!,
-        srcTileSize.width,
+        srcTile.width,
         isHDR
       );
 
-      for (let y = 0; y < dstHeight; y++) {
-        for (let x = 0; x < dstWidth; x++) {
-          const i1 = (y * dstWidth + x) * 4;
+      for (let y = 0; y < dstTile.height; y++) {
+        for (let x = 0; x < dstTile.width; x++) {
+          const i1 = (y * dstTile.width + x) * 4;
           const i2 = ((y + dstTile.y) * width + (x + dstTile.x)) * 4;
           for (let c = 0; c < 4; c++) {
             outputTileData!.data[i1 + c] = outputImageData!.data[i2 + c];
@@ -509,7 +484,9 @@ class UNet {
     normal,
     done,
     progress,
-    denoiseAlpha
+    denoiseAlpha,
+    tileOverlap,
+    scheduling = 'animation-frame'
   }: {
     color: T;
     albedo?: ImageData | GPUImageData;
@@ -518,6 +495,13 @@ class UNet {
      * If denoise alpha channel. Otherwise denoise RGB channels.
      */
     denoiseAlpha?: boolean;
+    /**
+     * Per-side context for boundaries shared with another tile. Defaults to
+     * half of the model receptive field rounded up to 16 pixels.
+     */
+    tileOverlap?: number;
+    /** How JavaScript yields between completed GPU tiles. */
+    scheduling?: 'animation-frame' | 'event-loop';
     done: (outputData: T extends GPUImageData ? GPUImageDataOutput : T) => void;
     progress?: (
       outputData: T extends GPUImageData ? GPUImageDataOutput : T,
@@ -540,9 +524,20 @@ class UNet {
     const width = color.width;
     const height = color.height;
     const adaptiveTileSize = this._dynamicTileController.tileSize;
-    const shouldAdaptTileSize =
-      width > adaptiveTileSize || height > adaptiveTileSize;
-    this._updateModel(width, height);
+    const defaultTileOverlap = roundUp(
+      this._modelSpec.receptiveField / 2,
+      OIDN_TILE_ALIGNMENT
+    );
+    const resolvedTileOverlap = tileOverlap === undefined
+      ? defaultTileOverlap
+      : roundUp(Math.max(0, tileOverlap), OIDN_TILE_ALIGNMENT);
+    const plan = planTileGrid(
+      width,
+      height,
+      adaptiveTileSize,
+      resolvedTileOverlap
+    );
+    const shouldAdaptTileSize = plan.tiles.length > 1;
 
     // TODO should fixed to be hdr when UNet is created.
     // weights of hdr and ldr is different
@@ -557,11 +552,6 @@ class UNet {
         hdr
       );
     }
-    const tileWidth = this._tileWidth;
-    const tileHeight = this._tileHeight;
-    const tileCountH = Math.ceil(height / tileHeight);
-    const tileCountW = Math.ceil(width / tileWidth);
-
     function makeImageData(width: number, height: number) {
       return hdr
         ? {
@@ -575,9 +565,6 @@ class UNet {
     const outputImageData = isGPUImageData(color)
       ? undefined
       : makeImageData(width, height);
-    const outputTileData = isGPUImageData(color)
-      ? undefined
-      : makeImageData(Math.min(tileWidth, width), Math.min(tileHeight, height));
 
     let aborted = false;
 
@@ -586,17 +573,24 @@ class UNet {
     const executionStartTime = now();
     const tileTimesMs: number[] = [];
     const scheduleNextTile = (callback: () => void) => {
-      if (typeof requestAnimationFrame === 'undefined') {
+      if (
+        scheduling === 'event-loop' ||
+        typeof requestAnimationFrame === 'undefined'
+      ) {
         setTimeout(callback, 0);
       } else {
         requestAnimationFrame(callback);
       }
     };
 
-    const executeTile = async (i: number, j: number) => {
+    const executeTile = async (tileIndex: number) => {
       if (aborted) {
         return;
       }
+      const tile = plan.tiles[tileIndex];
+      const outputTileData = isGPUImageData(color)
+        ? undefined
+        : makeImageData(tile.output.width, tile.output.height);
       const tileStartTime = now();
       const resGPUBuffer = await this._executeTile(
         isGPUImageData(color)
@@ -608,8 +602,8 @@ class UNet {
           : rawData,
         outputTileData,
         outputImageData,
-        i,
-        j,
+        tile,
+        tileIndex === 0,
         width,
         height,
         hdr,
@@ -625,12 +619,17 @@ class UNet {
         output as any,
         // Is undefined if using webgpu buffer
         outputTileData as any,
-        new Tile(i * tileWidth, j * tileHeight, tileWidth, tileHeight),
-        i + j * tileCountW,
-        tileCountW * tileCountH
+        new Tile(
+          tile.output.x,
+          tile.output.y,
+          tile.output.width,
+          tile.output.height
+        ),
+        tileIndex,
+        plan.tiles.length
       );
 
-      const hasNextTile = i + 1 < tileCountW || j + 1 < tileCountH;
+      const hasNextTile = tileIndex + 1 < plan.tiles.length;
       const continueAfterGPUWork = () => {
         tileTimesMs.push(now() - tileStartTime);
         if (aborted) return;
@@ -638,11 +637,7 @@ class UNet {
         if (hasNextTile) {
           scheduleNextTile(() => {
             if (aborted) return;
-            if (i + 1 < tileCountW) {
-              executeTile(i + 1, j);
-            } else if (j + 1 < tileCountH) {
-              executeTile(0, j + 1);
-            }
+            executeTile(tileIndex + 1);
           });
         } else {
           const sortedTileTimes = [...tileTimesMs].sort((a, b) => a - b);
@@ -653,9 +648,14 @@ class UNet {
           this._lastExecution = {
             width,
             height,
-            tileWidth,
-            tileHeight,
-            tileCount: tileCountW * tileCountH,
+            tileWidth: plan.maxOutputWidth,
+            tileHeight: plan.maxOutputHeight,
+            tileCount: plan.tiles.length,
+            tileColumns: plan.columns,
+            tileRows: plan.rows,
+            tileOverlap: plan.overlap,
+            inputPixelCount: plan.inputPixelCount,
+            inputShapeCount: plan.inputShapeCount,
             durationMs: now() - executionStartTime,
             tileTimeMs: {
               min: sortedTileTimes[0],
@@ -684,7 +684,7 @@ class UNet {
       );
     };
 
-    executeTile(0, 0);
+    executeTile(0);
 
     return () => {
       aborted = true;

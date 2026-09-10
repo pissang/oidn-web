@@ -8,7 +8,7 @@ import {
 } from '../lib/tileScheduler.js';
 
 test('starts conservatively and respects the hard maximum', () => {
-  assert.equal(new DynamicTileController(512).tileSize, 384);
+  assert.equal(new DynamicTileController(512).tileSize, 432);
   assert.equal(new DynamicTileController(320).tileSize, 320);
   assert.equal(fitTileDimension(512, 384), 384);
   assert.equal(fitTileDimension(300, 384), 304);
@@ -17,23 +17,27 @@ test('starts conservatively and respects the hard maximum', () => {
 test('reduces slow tiles and grows fast tiles within configured bounds', () => {
   const controller = new DynamicTileController(512);
 
+  assert.equal(controller.observe([30, 32, 34]), false);
   assert.equal(controller.observe([30, 32, 34]), true);
-  assert.equal(controller.tileSize, 256);
+  assert.equal(controller.tileSize, 416);
   assert.equal(controller.observe([40]), false);
-  assert.equal(controller.tileSize, 256);
+  assert.equal(controller.observe([40]), true);
+  assert.equal(controller.tileSize, 400);
 
+  assert.equal(controller.observe([4, 6, 8]), false);
   assert.equal(controller.observe([4, 6, 8]), true);
-  assert.equal(controller.tileSize, 384);
-  assert.equal(controller.observe([5]), true);
-  assert.equal(controller.tileSize, 512);
+  assert.equal(controller.tileSize, 416);
   assert.equal(controller.observe([5]), false);
+  assert.equal(controller.observe([5]), true);
+  assert.equal(controller.tileSize, 432);
 });
 
-test('uses the median and ignores invalid timings', () => {
+test('uses a smoothed P75, excludes the cold first tile, and ignores invalid timings', () => {
   const controller = new DynamicTileController(512);
 
-  assert.equal(controller.observe([1, 30, Number.NaN]), false);
-  assert.equal(controller.tileSize, 384);
+  assert.equal(controller.observe([100, 8, 9, 10, 40, Number.NaN]), false);
+  assert.equal(controller.observe([100, 8, 9, 10, 40]), true);
+  assert.equal(controller.tileSize, 448);
   assert.equal(controller.observe([Number.NaN, Number.POSITIVE_INFINITY]), false);
 });
 
@@ -55,7 +59,9 @@ test('supports custom adaptive limits and timing targets', () => {
 
   assert.equal(controller.tileSize, 512);
   controller.observe([40]);
+  controller.observe([40]);
   assert.equal(controller.tileSize, 448);
+  controller.observe([8]);
   controller.observe([8]);
   assert.equal(controller.tileSize, 512);
 });

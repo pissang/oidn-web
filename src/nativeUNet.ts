@@ -1939,6 +1939,13 @@ export class NativeUNetExecutor {
     return execution;
   }
 
+  /** Allocates shape-dependent execution resources before interactive use. */
+  prewarm(shapes: readonly { width: number; height: number }[]) {
+    for (const shape of shapes) {
+      this._execution(shape.width, shape.height);
+    }
+  }
+
   /** Captures per-pass GPU timestamps for the next execute call when supported. */
   profileNextExecution() {
     if (!this._device.features.has('timestamp-query')) return false;

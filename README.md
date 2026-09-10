@@ -50,8 +50,8 @@ initUNetFromURL('./weights/rt_ldr.tza').then((unet) => {
     .getContext('2d')
     .getImageData(0, 0, width, height);
 
-  // Tile execute the denoising.
-  // If the resolution is high. It will split the input into tiles and execute one tile per frame.
+  // Tile execute the denoising. High resolutions use balanced rectangular
+  // tiles with overlap only at boundaries shared by another tile.
   const abortDenoising = unet.tileExecute({
     // The color input for LDR image is 4 channels.
     // In the format of Uint8ClampedArray or Uint8Array.
@@ -244,11 +244,15 @@ next tile. This keeps at most one OIDN tile in flight, which makes cancellation
 responsive instead of leaving queued denoising work ahead of interactive
 rendering.
 
-Tile sizing is adaptive by default. `maxTileSize` is a hard upper bound; the
-completed GPU time of a tiled execution adjusts the tile size used by the next
-execution. Single-tile images do not affect the estimate. The default range
-starts at 384 pixels, does not go below 256, and targets about 16 ms of GPU work
-per tile.
+Tile sizing is adaptive by default. `maxTileSize` is a hard upper bound. Each
+execution partitions the image into balanced rectangular output regions and
+adds model context only on edges shared with another tile. Input shapes are
+bucketed to at most two sizes so the native execution cache remains stable.
+The smoothed P75 GPU time of completed tiled executions adjusts the maximum tile
+size used by the next execution. The potentially cold first tile is excluded,
+cancelled and single-tile work is ignored, and a layout is held for at least two
+complete executions. The default range starts at 432 pixels, does not go below
+256, changes in 16-pixel steps, and targets about 16 ms of GPU work per tile.
 
 ```ts
 initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
@@ -257,8 +261,22 @@ initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
   maxTileSize: 512,
   dynamicTile: {
     minTileSize: 256,
-    initialTileSize: 384,
+    initialTileSize: 432,
     targetTileTimeMs: 16
+  }
+});
+
+// A latency-oriented caller can use a smaller halo and avoid waiting for a
+// display-frame boundary between completed tiles. The default overlap remains
+// half of the model receptive field rounded up to 16 pixels.
+unet.tileExecute({
+  color,
+  albedo,
+  normal,
+  tileOverlap: 80,
+  scheduling: 'event-loop',
+  done(denoised) {
+    // ...
   }
 });
 

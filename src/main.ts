@@ -10,7 +10,14 @@ import type {
 } from './nativeUNet';
 
 export { parseTZA, UNet };
-export type { DynamicTileOptions, DynamicTileSetting } from './tileScheduler';
+export { planTileGrid } from './tileScheduler';
+export type {
+  DynamicTileOptions,
+  DynamicTileSetting,
+  PlannedTile,
+  TilePlan,
+  TileRect
+} from './tileScheduler';
 export {
   detectUNetModelSpec,
   OIDN_UNET_LARGE_SPEC,
