@@ -30,8 +30,8 @@ export type NativeUNetKernelSetting = NativeUNetKernel | 'auto';
 export interface NativeUNetOptions {
   precision?: NativeUNetPrecisionSetting;
   /**
-   * Convolution kernel selection. `auto` uses a model-independent capability
-   * heuristic and falls back to the direct kernel when a tile does not fit.
+   * Convolution kernel selection. `auto` uses implicit GEMM for FP16/FP32
+   * convolutions and the direct kernel for the final output layer.
    */
   kernel?: NativeUNetKernelSetting;
   /** Maximum number of shape-dependent activation plans retained. */
@@ -691,7 +691,7 @@ fn main(
 }
 
 /**
- * Implicit-GEMM convolution for FP32. This follows the proven packed WebGPU
+ * Implicit-GEMM convolution for FP16/FP32. This follows the packed WebGPU
  * shape: one 8x8 workgroup computes 32 spatial rows by 8 vec4 output blocks,
  * with four output rows per thread and an eight-vec4 K tile.
  */
@@ -1661,7 +1661,7 @@ export class NativeUNetExecutor {
     if (this.kernelSetting === 'subgroup') {
       return this.subgroupsAvailable ? 'subgroup' : 'direct';
     }
-    if (this.precision === 'fp32' && !isFinal) return 'implicit-gemm';
+    if (!isFinal) return 'implicit-gemm';
     return 'direct';
   }
 

@@ -56,7 +56,7 @@ export interface UNetOptions {
   engine?: UNetEngineSetting;
   /** `auto` selects FP16 when shader-f16 was enabled on the GPUDevice. */
   precision?: NativeUNetPrecisionSetting;
-  /** `auto` selects kernels from precision, operation shape, and GPU limits. */
+  /** `auto` uses implicit GEMM for FP16/FP32 convolutions, except the direct output layer. */
   kernel?: NativeUNetKernelSetting;
   /** Versioned topology descriptor for future/custom OIDN TZA models. */
   modelSpec?: UNetModelSpec;
