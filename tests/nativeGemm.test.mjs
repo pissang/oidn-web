@@ -64,22 +64,28 @@ class FakeBuffer {
   }
 }
 
-function fakeDevice({ maxComputeWorkgroupStorageSize = 32768 } = {}) {
+function fakeDevice({
+  maxComputeWorkgroupStorageSize = 32768,
+  maxComputeWorkgroupsPerDimension = 65535
+} = {}) {
   const shaderLabels = [];
   const shaderCodes = [];
   const pipelineLabels = [];
+  const dispatches = [];
   const device = {
     features: new Set(['shader-f16']),
     limits: {
       maxComputeInvocationsPerWorkgroup: 256,
       maxComputeWorkgroupSizeX: 256,
       maxComputeWorkgroupSizeY: 256,
-      maxComputeWorkgroupStorageSize
+      maxComputeWorkgroupStorageSize,
+      maxComputeWorkgroupsPerDimension
     },
     buffers: [],
     shaderLabels,
     shaderCodes,
     pipelineLabels,
+    dispatches,
     queue: {
       submit() {},
       onSubmittedWorkDone: () => Promise.resolve()
@@ -111,7 +117,9 @@ function fakeDevice({ maxComputeWorkgroupStorageSize = 32768 } = {}) {
           return {
             setPipeline() {},
             setBindGroup() {},
-            dispatchWorkgroups() {},
+            dispatchWorkgroups(...sizes) {
+              dispatches.push(sizes);
+            },
             end() {}
           };
         },
@@ -205,6 +213,52 @@ function testModel(dataType) {
     model: validateUNetModel(tensors, TEST_SPEC),
     hiddenValues
   };
+}
+
+function poolModel(dataType = 'Float16') {
+  const spec = {
+    schemaVersion: 1,
+    id: 'native-gemm-pool-test-unet',
+    family: 'native-gemm-pool-test',
+    input: 'input',
+    output: 'output',
+    receptiveField: 7,
+    nodes: [
+      {
+        op: 'conv2d',
+        id: 'hidden',
+        input: 'input',
+        weight: 'hidden.weight',
+        bias: 'hidden.bias',
+        activation: 'relu',
+        padding: 'same'
+      },
+      {
+        op: 'maxPool2d',
+        id: 'pool',
+        input: 'hidden',
+        size: 2,
+        stride: 2,
+        padding: 'same'
+      },
+      {
+        op: 'conv2d',
+        id: 'output',
+        input: 'pool',
+        weight: 'output.weight',
+        bias: 'output.bias',
+        activation: 'identity',
+        padding: 'same'
+      }
+    ]
+  };
+  const tensors = new Map([
+    ['hidden.weight', tensor([5, 3, 3, 3], 'oihw', dataType, Array(5 * 3 * 3 * 3).fill(1))],
+    ['hidden.bias', tensor([5], 'x', dataType, [0, 0, 0, 0, 0])],
+    ['output.weight', tensor([3, 5, 3, 3], 'oihw', dataType, Array(3 * 5 * 3 * 3).fill(1))],
+    ['output.bias', tensor([3], 'x', dataType, [0, 0, 0])]
+  ]);
+  return validateUNetModel(tensors, spec);
 }
 
 function expectedPacked(hiddenValues, dataType, layout) {
@@ -332,6 +386,9 @@ test('freezes normalized GEMM configuration without mutating caller input', asyn
       { precision: 'fp32', kernel: 'implicit-gemm', gemm: input }
     );
     assert.deepEqual(executor.gemm, {
+      poolLayout: 'channels',
+      sharedLayout: 'padded',
+      accumulationOrder: 'k-major',
       finalLayer: 'shared-auto',
       loadMode: 'native',
       addressMode: 'incremental',
@@ -359,6 +416,9 @@ test('rejects unsupported GEMM address, layout, register, workgroup, and storage
   await withGpuUsage(() => {
     const model = testModel('Float32').model;
     for (const gemm of [
+      { poolLayout: 'bad' },
+      { sharedLayout: 'bad' },
+      { accumulationOrder: 'bad' },
       { addressMode: 'bad' },
       { loadMode: 'bad' },
       { finalLayer: 'bad' },
@@ -387,7 +447,7 @@ test('rejects unsupported GEMM address, layout, register, workgroup, and storage
   });
 });
 
-test('pipeline cache ABI separates address, weight layout, and tile variants', async () => {
+test('pipeline cache ABI separates address, weight layout, tile, shared-layout, and accumulation variants', async () => {
   await withGpuUsage(async () => {
     const device = fakeDevice();
     const model = testModel('Float32').model;
@@ -410,11 +470,124 @@ test('pipeline cache ABI separates address, weight layout, and tile variants', a
     );
     await kMajor.prepare();
     const secondLabels = device.pipelineLabels.slice(firstLabels.length);
-    assert.ok(firstLabels.some((label) => label.includes('address-analytic/weights-output-major-v1/tile-8x8-r4')));
-    assert.ok(secondLabels.some((label) => label.includes('address-incremental/weights-k-major-v1/tile-4x8-r2/loads-packed-all')));
+    assert.ok(firstLabels.some((label) => label.includes('address-analytic/weights-output-major-v1/tile-8x8-r4/loads-native/shared-padded/acc-k-major')));
+    assert.ok(secondLabels.some((label) => label.includes('address-incremental/weights-k-major-v1/tile-4x8-r2/loads-packed-all/shared-padded/acc-k-major')));
     assert.notDeepEqual(firstLabels, secondLabels);
+    const paddedRowMajor = new NativeUNetExecutor(
+      device,
+      model,
+      executorOptions('fp32', 'k-major', {
+        addressMode: 'incremental',
+        sharedLayout: 'padded-input',
+        accumulationOrder: 'row-major'
+      })
+    );
+    await paddedRowMajor.prepare();
+    const thirdLabels = device.pipelineLabels.slice(secondLabels.length + firstLabels.length);
+    assert.ok(thirdLabels.some((label) =>
+      label.includes('address-incremental/weights-k-major-v1/tile-8x8-r4/loads-native/shared-padded-input/acc-row-major')
+    ));
+    assert.notDeepEqual(secondLabels, thirdLabels);
+    const paddedWeights = new NativeUNetExecutor(
+      device,
+      model,
+      executorOptions('fp32', 'k-major', {
+        addressMode: 'incremental',
+        sharedLayout: 'padded-weights'
+      })
+    );
+    await paddedWeights.prepare();
+    const fourthLabels = device.pipelineLabels.slice(
+      firstLabels.length + secondLabels.length + thirdLabels.length
+    );
+    assert.ok(fourthLabels.some((label) =>
+      label.includes('address-incremental/weights-k-major-v1/tile-8x8-r4/loads-native/shared-padded-weights/acc-k-major')
+    ));
     analytic.dispose();
     kMajor.dispose();
+    paddedRowMajor.dispose();
+    paddedWeights.dispose();
+  });
+});
+
+test('padded shared-memory layout accepts its exact storage limit and rejects one byte below it', async () => {
+  await withGpuUsage(() => {
+    const model = testModel('Float16').model;
+    const exact = new NativeUNetExecutor(
+      fakeDevice({ maxComputeWorkgroupStorageSize: 6720 }),
+      model,
+      executorOptions('fp16', 'k-major', {
+        sharedLayout: 'padded',
+        rowsPerThread: 8,
+        workgroupSize: [8, 8]
+      })
+    );
+    exact.dispose();
+    assert.throws(
+      () => new NativeUNetExecutor(
+        fakeDevice({ maxComputeWorkgroupStorageSize: 6719 }),
+        model,
+        executorOptions('fp16', 'k-major', {
+          sharedLayout: 'padded',
+          rowsPerThread: 8,
+          workgroupSize: [8, 8]
+        })
+      ),
+      /Unsupported GEMM tile configuration/
+    );
+  });
+});
+
+test('channel-coalesced pooling gets its own pipeline and dispatch shape, while direct ignores it', async () => {
+  await withGpuUsage(async () => {
+    const model = poolModel();
+    const coalescedDevice = fakeDevice();
+    const coalesced = new NativeUNetExecutor(
+      coalescedDevice,
+      model,
+      executorOptions('fp16', 'k-major', { poolLayout: 'channels' })
+    );
+    assert.equal(coalesced.gemm.poolLayout, 'channels');
+    await coalesced.prepare();
+    assert.ok(coalescedDevice.pipelineLabels.some((label) =>
+      label.includes('max-pool/fp16/out2/channels')
+    ));
+    coalesced.execute([new FakeBuffer(16 * 16 * 16)], 16, 16);
+    assert.deepEqual(coalescedDevice.dispatches.at(-2), [2, 1, 1]);
+
+    const wrappedDevice = fakeDevice({ maxComputeWorkgroupsPerDimension: 2 });
+    const wrapped = new NativeUNetExecutor(
+      wrappedDevice,
+      model,
+      executorOptions('fp16', 'k-major', { poolLayout: 'channels' })
+    );
+    await wrapped.prepare();
+    wrapped.execute([new FakeBuffer(32 * 32 * 16)], 32, 32);
+    assert.deepEqual(wrappedDevice.dispatches.at(-2), [2, 2, 2]);
+
+    const directDevice = fakeDevice();
+    const direct = new NativeUNetExecutor(
+      directDevice,
+      model,
+      {
+        precision: 'fp16',
+        kernel: 'direct',
+        gemm: { poolLayout: 'channels' }
+      }
+    );
+    assert.equal(direct.gemm.poolLayout, 'channels');
+    await direct.prepare();
+    assert.ok(directDevice.pipelineLabels.some((label) =>
+      label.includes('max-pool/fp16/out2/spatial')
+    ));
+    assert.ok(!directDevice.pipelineLabels.some((label) =>
+      label.includes('max-pool/fp16/out2/channels')
+    ));
+    direct.execute([new FakeBuffer(16 * 16 * 16)], 16, 16);
+    assert.deepEqual(directDevice.dispatches.at(-2), [1, 1, 2]);
+    coalesced.dispose();
+    wrapped.dispose();
+    direct.dispose();
   });
 });
 
@@ -448,7 +621,10 @@ test('selects final shared-load variants and falls back when the halo exceeds sh
     const fallback = new NativeUNetExecutor(
       fakeDevice({ maxComputeWorkgroupStorageSize: 4096 }),
       wideFinalModel(),
-      executorOptions('fp16', 'k-major', { finalLayer: 'shared-input' })
+      executorOptions('fp16', 'k-major', {
+        finalLayer: 'shared-input',
+        sharedLayout: 'linear'
+      })
     );
     await fallback.prepare();
     assert.ok(fallback._pipelineCache instanceof Map);
@@ -488,7 +664,10 @@ test('shared-auto chooses weight cache, input-only cache, then direct fallback b
     const fallback = new NativeUNetExecutor(
       fallbackDevice,
       wideFinalModel(),
-      executorOptions('fp16', 'k-major', { finalLayer: 'shared-auto' })
+      executorOptions('fp16', 'k-major', {
+        finalLayer: 'shared-auto',
+        sharedLayout: 'linear'
+      })
     );
     await fallback.prepare();
     assert.ok(fallbackDevice.pipelineLabels.some((label) =>

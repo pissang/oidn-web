@@ -30,6 +30,12 @@ export type NativeUNetKernelSetting = NativeUNetKernel | 'auto';
 export type NativeUNetGemmWorkgroup = readonly [4 | 8 | 16, 4 | 8];
 
 export interface NativeUNetGemmOptions {
+  /** Internal pooling dispatch experiment for the GEMM execution path. */
+  poolLayout?: 'spatial' | 'channels';
+  /** Internal shared-memory padding experiment; does not change storage ABI. */
+  sharedLayout?: 'linear' | 'padded' | 'padded-input' | 'padded-weights';
+  /** Internal loop scheduling experiment; each output keeps the same K order. */
+  accumulationOrder?: 'k-major' | 'row-major';
   /** Internal final-convolution experiments; retains the original FP16 partial order. */
   finalLayer?: 'direct' | 'shared-input' | 'shared-input-weights' | 'shared-auto';
   /** Internal load-layout experiments; packed loads preserve the FP16 storage bits. */
@@ -132,6 +138,30 @@ function gemmTile(options: Readonly<Required<NativeUNetGemmOptions>>) {
     // Keep the half partial accumulation grouping independent of tile tuning.
     tileKBlocks: TILED_CONV_K_BLOCKS
   };
+}
+
+// Holes change only workgroup addresses. Cooperative loads still visit the
+// original dense logical tiles and never read the unused padding elements.
+function gemmSharedSizes(options: Readonly<Required<NativeUNetGemmOptions>>) {
+  const tile = gemmTile(options);
+  const paddedInput = options.sharedLayout === 'padded' || options.sharedLayout === 'padded-input';
+  const paddedWeights = options.sharedLayout === 'padded' || options.sharedLayout === 'padded-weights';
+  return {
+    input: tile.tileM * tile.tileKBlocks + (paddedInput ? tile.workgroupY : 0),
+    weights: tile.tileKBlocks * tile.tileNBlocks * (paddedWeights ? 5 : 4)
+  };
+}
+
+function gemmSharedInputIndex(index: string, options: Readonly<Required<NativeUNetGemmOptions>>) {
+  return options.sharedLayout === 'padded' || options.sharedLayout === 'padded-input'
+    ? `(${index}) + (${index}) / ${options.rowsPerThread * TILED_CONV_K_BLOCKS}u`
+    : index;
+}
+
+function gemmSharedWeightIndex(index: string, options: Readonly<Required<NativeUNetGemmOptions>>) {
+  return options.sharedLayout === 'padded' || options.sharedLayout === 'padded-weights'
+    ? `(${index}) + (${index}) / 4u`
+    : index;
 }
 
 function roundUp(value: number, alignment: number) {
@@ -431,6 +461,27 @@ function gemmLoadExpression(expression: string, packed: boolean) {
 
 function tiledAccumulationCode(precision: NativeUNetPrecision, gemm: Readonly<Required<NativeUNetGemmOptions>>) {
   const { rowsPerThread, tileNBlocks, tileKBlocks } = gemmTile(gemm);
+  const inputIndex = gemmSharedInputIndex(`tileSpatial * ${tileKBlocks}u + tileK`, gemm);
+  const weightBase = `(tileK * ${tileNBlocks}u + localId.x) * ${gemm.sharedLayout === 'padded' || gemm.sharedLayout === 'padded-weights' ? 5 : 4}u`;
+  if (gemm.accumulationOrder === 'row-major') {
+    const valueType = storageVecType(precision);
+    const target = precision === 'fp16' ? 'partial' : 'acc[row]';
+    return /* wgsl */ `
+    for (var row = 0u; row < ${rowsPerThread}u; row++) {
+      ${precision === 'fp16' ? 'var partial = vec4<f16>(0.0h);' : ''}
+      let tileSpatial = localId.y * ${rowsPerThread}u + row;
+      for (var tileK = 0u; tileK < ${tileKBlocks}u; tileK++) {
+        let weightBase = ${weightBase};
+        let inputValue = inputTile[${inputIndex}];
+        ${target} = fma(weightTile[weightBase], ${valueType}(inputValue.x), ${target});
+        ${target} = fma(weightTile[weightBase + 1u], ${valueType}(inputValue.y), ${target});
+        ${target} = fma(weightTile[weightBase + 2u], ${valueType}(inputValue.z), ${target});
+        ${target} = fma(weightTile[weightBase + 3u], ${valueType}(inputValue.w), ${target});
+      }
+      ${precision === 'fp16' ? 'acc[row] += vec4<f32>(partial);' : ''}
+    }
+`;
+  }
   if (precision === 'fp16') {
     return /* wgsl */ `
     var partial: array<vec4<f16>, ${rowsPerThread}>;
@@ -439,12 +490,12 @@ function tiledAccumulationCode(precision: NativeUNetPrecision, gemm: Readonly<Re
     }
     for (var tileK = 0u; tileK < ${tileKBlocks}u; tileK++) {
       let weightBase =
-        (tileK * ${tileNBlocks}u + localId.x) * 4u;
+        ${weightBase};
       for (var row = 0u; row < ${rowsPerThread}u; row++) {
         let tileSpatial =
           localId.y * ${rowsPerThread}u + row;
         let inputValue =
-          inputTile[tileSpatial * ${tileKBlocks}u + tileK];
+          inputTile[${inputIndex}];
         partial[row] = fma(
           weightTile[weightBase],
           vec4<f16>(inputValue.x),
@@ -475,12 +526,12 @@ function tiledAccumulationCode(precision: NativeUNetPrecision, gemm: Readonly<Re
   return /* wgsl */ `
     for (var tileK = 0u; tileK < ${tileKBlocks}u; tileK++) {
       let weightBase =
-        (tileK * ${tileNBlocks}u + localId.x) * 4u;
+        ${weightBase};
       for (var row = 0u; row < ${rowsPerThread}u; row++) {
         let tileSpatial =
           localId.y * ${rowsPerThread}u + row;
         let inputValue =
-          inputTile[tileSpatial * ${tileKBlocks}u + tileK];
+          inputTile[${inputIndex}];
         acc[row] = fma(
           weightTile[weightBase],
           vec4<f32>(inputValue.x),
@@ -806,7 +857,7 @@ function tiledIncrementalInputCode(valueType: string, readValue: string, gemm: R
         let inputY = i32(cachedY[load]) + i32(kernelY) - 1;`}
         ${readValue}
       }
-      inputTile[loadIndex] = value;
+      inputTile[${gemmSharedInputIndex('loadIndex', gemm)}] = value;
     }
 `;
 }
@@ -856,8 +907,8 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> outputData: array<${outputType}>;
 @group(0) @binding(4) var<uniform> params: Params;
 
-var<workgroup> inputTile: array<${inputType}, ${inputTileValues}>;
-var<workgroup> weightTile: array<${inputType}, ${weightTileValues}>;
+var<workgroup> inputTile: array<${inputType}, ${gemmSharedSizes(gemm).input}>;
+var<workgroup> weightTile: array<${inputType}, ${gemmSharedSizes(gemm).weights}>;
 
 @compute @workgroup_size(${workgroupX}, ${workgroupY}, 1)
 fn main(
@@ -918,7 +969,7 @@ fn main(
           value = ${gemmLoadExpression('inputData[inputIndex]', packedInput)};
         }
       }
-      inputTile[loadIndex] = value;
+      inputTile[${gemmSharedInputIndex('loadIndex', gemm)}] = value;
     }
     `}
 
@@ -951,7 +1002,7 @@ fn main(
         `}
         value = ${gemmLoadExpression('weights[weightIndex]', packedWeights)};
       }
-      weightTile[loadIndex] = value;
+      weightTile[${gemmSharedWeightIndex('loadIndex', gemm)}] = value;
     }
 
     workgroupBarrier();
@@ -1036,7 +1087,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 function createMaxPoolShader(
   precision: NativeUNetPrecision,
-  outputBlocks: number
+  outputBlocks: number,
+  coalesced: boolean
 ) {
   const valueType = storageVecType(precision);
   return /* wgsl */ `${shaderPreamble(precision)}
@@ -1052,11 +1104,17 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE}, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>${coalesced ? ',\n  @builtin(num_workgroups) groupCount: vec3<u32>' : ''}
+) {
+  ${coalesced ? `let linearX = gid.x + gid.z * groupCount.x * ${WORKGROUP_SIZE}u;
+  let outputBlock = linearX % ${outputBlocks}u;
+  let outputX = linearX / ${outputBlocks}u;` : `let outputBlock = gid.z;
+  let outputX = gid.x;`}
   if (
-    gid.x >= params.outputWidth ||
+    outputX >= params.outputWidth ||
     gid.y >= params.outputHeight ||
-    gid.z >= ${outputBlocks}u
+    outputBlock >= ${outputBlocks}u
   ) {
     return;
   }
@@ -1065,15 +1123,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inputY = gid.y * 2u + py;
     if (inputY >= params.inputHeight) { continue; }
     for (var px = 0u; px < 2u; px++) {
-      let inputX = gid.x * 2u + px;
+      let inputX = outputX * 2u + px;
       if (inputX >= params.inputWidth) { continue; }
       let inputIndex =
-        (inputY * params.inputWidth + inputX) * ${outputBlocks}u + gid.z;
+        (inputY * params.inputWidth + inputX) * ${outputBlocks}u + outputBlock;
       pooled = max(pooled, vec4<f32>(inputData[inputIndex]));
     }
   }
   let outputIndex =
-    (gid.y * params.outputWidth + gid.x) * ${outputBlocks}u + gid.z;
+    (gid.y * params.outputWidth + outputX) * ${outputBlocks}u + outputBlock;
   outputData[outputIndex] = ${storeExpression('pooled', precision)};
 }
 `;
@@ -1147,8 +1205,8 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> outputData: array<${outputType}>;
 @group(0) @binding(5) var<uniform> params: Params;
 
-var<workgroup> inputTile: array<${valueType}, ${inputTileValues}>;
-var<workgroup> weightTile: array<${valueType}, ${weightTileValues}>;
+var<workgroup> inputTile: array<${valueType}, ${gemmSharedSizes(gemm).input}>;
+var<workgroup> weightTile: array<${valueType}, ${gemmSharedSizes(gemm).weights}>;
 
 @compute @workgroup_size(${workgroupX}, ${workgroupY}, 1)
 fn main(
@@ -1211,7 +1269,7 @@ fn main(
           }
         }
       }
-      inputTile[loadIndex] = value;
+      inputTile[${gemmSharedInputIndex('loadIndex', gemm)}] = value;
     }
     `}
 
@@ -1244,7 +1302,7 @@ fn main(
         `}
         value = ${gemmLoadExpression('weights[weightIndex]', packedWeights)};
       }
-      weightTile[loadIndex] = value;
+      weightTile[${gemmSharedWeightIndex('loadIndex', gemm)}] = value;
     }
 
     workgroupBarrier();
@@ -1569,6 +1627,9 @@ export class NativeUNetExecutor {
     this.kernelSetting = options.kernel ?? 'auto';
     const workgroupSize = options.gemm?.workgroupSize ?? [8, 8];
     this.gemm = Object.freeze({
+      poolLayout: options.gemm?.poolLayout ?? 'channels',
+      sharedLayout: options.gemm?.sharedLayout ?? (this.precision === 'fp16' ? 'padded-input' : 'padded'),
+      accumulationOrder: options.gemm?.accumulationOrder ?? 'k-major',
       finalLayer: options.gemm?.finalLayer ?? 'shared-auto',
       loadMode: options.gemm?.loadMode ?? 'native',
       addressMode: options.gemm?.addressMode ?? 'incremental',
@@ -1576,6 +1637,15 @@ export class NativeUNetExecutor {
       rowsPerThread: options.gemm?.rowsPerThread ?? 8,
       workgroupSize: Object.freeze([workgroupSize[0], workgroupSize[1]]) as NativeUNetGemmWorkgroup
     });
+    if (!['spatial', 'channels'].includes(this.gemm.poolLayout)) {
+      throw new Error(`Unsupported GEMM pool layout: ${this.gemm.poolLayout}`);
+    }
+    if (!['linear', 'padded', 'padded-input', 'padded-weights'].includes(this.gemm.sharedLayout)) {
+      throw new Error(`Unsupported GEMM shared layout: ${this.gemm.sharedLayout}`);
+    }
+    if (!['k-major', 'row-major'].includes(this.gemm.accumulationOrder)) {
+      throw new Error(`Unsupported GEMM accumulation order: ${this.gemm.accumulationOrder}`);
+    }
     if (!['direct', 'shared-input', 'shared-input-weights', 'shared-auto'].includes(this.gemm.finalLayer)) {
       throw new Error(`Unsupported GEMM final layer: ${this.gemm.finalLayer}`);
     }
@@ -1590,7 +1660,7 @@ export class NativeUNetExecutor {
     }
     const tile = gemmTile(this.gemm);
     const tileStorageBytes =
-      (tile.tileM * tile.tileKBlocks + tile.tileKBlocks * tile.tileNBlocks * 4) *
+      (gemmSharedSizes(this.gemm).input + gemmSharedSizes(this.gemm).weights) *
       4 * (this.precision === 'fp16' ? 2 : 4);
     if (
       ![2, 4, 8].includes(tile.rowsPerThread) ||
@@ -1764,7 +1834,7 @@ export class NativeUNetExecutor {
         `in${inputBlocks}/out${outputBlocks}` +
         (kernel === 'implicit-gemm'
           ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}`
+            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}/shared-${this.gemm.sharedLayout}/acc-${this.gemm.accumulationOrder}`
           : '');
       return {
         key,
@@ -1807,11 +1877,12 @@ export class NativeUNetExecutor {
       const outputBlocks = blocksForChannels(
         this._model.channelsByValue.get(node.id)!
       );
-      const key = `max-pool/${this.precision}/out${outputBlocks}`;
+      const coalesced = this._coalescedPool();
+      const key = `max-pool/${this.precision}/out${outputBlocks}/${coalesced ? 'channels' : 'spatial'}`;
       return {
         key,
         kernel: 'direct',
-        code: createMaxPoolShader(this.precision, outputBlocks)
+        code: createMaxPoolShader(this.precision, outputBlocks, coalesced)
       };
     }
     if (node.op === 'fusedConvReluMaxPool2d') {
@@ -1863,7 +1934,7 @@ export class NativeUNetExecutor {
         `${sourceBlocks.join('+')}/out${outputBlocks}/up${upsampledSource}` +
         (kernel === 'implicit-gemm'
           ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}`
+            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}/shared-${this.gemm.sharedLayout}/acc-${this.gemm.accumulationOrder}`
           : '');
       return {
         key,
@@ -1900,6 +1971,11 @@ export class NativeUNetExecutor {
     throw new Error(
       `Native OIDN does not implement unfused ${node.op} node ${node.id}`
     );
+  }
+
+  private _coalescedPool() {
+    return this.gemm.poolLayout === 'channels' &&
+      (this.kernelSetting === 'auto' || this.kernelSetting === 'implicit-gemm');
   }
 
   private _selectConvKernel(
@@ -2321,7 +2397,18 @@ export class NativeUNetExecutor {
       );
       pass.setPipeline(execution.nodePipelines[index]);
       pass.setBindGroup(0, execution.nodeBindings[index]);
-      if (execution.nodeKernels[index] === 'implicit-gemm') {
+      if (node.op === 'maxPool2d' && this._coalescedPool()) {
+        const groupsX = Math.ceil(
+          outputShape.width * blocksForChannels(outputShape.channels) / WORKGROUP_SIZE
+        );
+        const maxGroups = this._device.limits.maxComputeWorkgroupsPerDimension;
+        // Wide channel rows continue in Z instead of exceeding the X limit.
+        pass.dispatchWorkgroups(
+          Math.min(groupsX, maxGroups),
+          Math.ceil(outputShape.height / WORKGROUP_SIZE),
+          Math.ceil(groupsX / maxGroups)
+        );
+      } else if (execution.nodeKernels[index] === 'implicit-gemm') {
         const tile = gemmTile(this.gemm);
         pass.dispatchWorkgroups(
           Math.ceil(
