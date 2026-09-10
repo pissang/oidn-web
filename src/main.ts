@@ -5,6 +5,7 @@ import { initWebGPUBackend, initWebGPUBackendWithDevice } from './backend';
 import type { DynamicTileSetting } from './tileScheduler';
 import type { UNetModelSpec } from './modelSpec';
 import type {
+  NativeUNetGemmOptions,
   NativeUNetKernelSetting,
   NativeUNetPrecisionSetting
 } from './nativeUNet';
@@ -43,6 +44,8 @@ export {
   resolveNativeUNetPrecision
 } from './nativeUNet';
 export type {
+  NativeUNetGemmWorkgroup,
+  NativeUNetGemmOptions,
   NativeUNetExecutionProfile,
   NativeUNetKernel,
   NativeUNetKernelSetting,
@@ -65,6 +68,8 @@ export interface UNetOptions {
   precision?: NativeUNetPrecisionSetting;
   /** `auto` uses implicit GEMM for FP16/FP32 convolutions, except the direct output layer. */
   kernel?: NativeUNetKernelSetting;
+  /** Optional implicit-GEMM tuning for native WGSL execution. */
+  gemm?: NativeUNetGemmOptions;
   /** Versioned topology descriptor for future/custom OIDN TZA models. */
   modelSpec?: UNetModelSpec;
 }

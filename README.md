@@ -17,7 +17,7 @@ four-channel layout, decoder `upsample + concat + conv` patterns are fused,
 and all network dispatches for a tile are submitted in one command buffer.
 FP16 and FP32 convolutions use channel-specialized implicit-GEMM tiles by
 default, with a direct convolution for the final output layer and separate
-max-pool passes. Set `kernel: 'direct'` to use the vector-FMA convolution path.
+max-pool passes.
 
 TZA half-float weights stay half-float when the device enables `shader-f16`.
 FP16 products are accumulated in short half-precision groups and periodically

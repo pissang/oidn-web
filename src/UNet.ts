@@ -21,6 +21,7 @@ import {
 } from './modelSpec';
 import {
   NativeUNetExecutor,
+  type NativeUNetGemmOptions,
   type NativeUNetKernelSetting,
   type NativeUNetPrecisionSetting
 } from './nativeUNet';
@@ -114,6 +115,7 @@ class UNet {
       precision?: NativeUNetPrecisionSetting;
       /** Model-independent convolution kernel selection. */
       kernel?: NativeUNetKernelSetting;
+      gemm?: NativeUNetGemmOptions;
       /** Explicit descriptor for a new OIDN topology not in the built-in registry. */
       modelSpec?: UNetModelSpec;
     } = {}
@@ -150,7 +152,7 @@ class UNet {
       this._nativeExecutor = new NativeUNetExecutor(
         this._device,
         validatedModel,
-        { precision: opts.precision, kernel: opts.kernel }
+        { precision: opts.precision, kernel: opts.kernel, gemm: opts.gemm }
       );
     }
   }
@@ -222,6 +224,7 @@ class UNet {
       kernel: this._nativeExecutor
         ? {
             configured: this._nativeExecutor.kernelSetting,
+            gemm: this._nativeExecutor.gemm,
             maxSpatialInputBlocks: this._nativeExecutor.maxSpatialInputBlocks,
             subgroupsAvailable: this._nativeExecutor.subgroupsAvailable
           }
