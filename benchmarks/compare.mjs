@@ -23,6 +23,7 @@ Options:
   --runs <n>           Measured executions per runtime (default: 5)
   --input-hdr <path>   Use a static Radiance HDR as the color input
   --default-only       Benchmark only the current runtime's default config
+  --direct-gemm-only   Compare v0.4.0 Direct with current Direct and GEMM
   --baseline <commit>  Reference commit (default: nearest TFJS ancestor)
   --chrome <path>      Chrome/Chromium executable
   --output <path>      JSON output (default: benchmarks/results/latest.json)
@@ -39,6 +40,7 @@ function parseArgs(argv) {
     runs: 5,
     inputHDR: null,
     defaultOnly: false,
+    directGemmOnly: false,
     output: path.join(benchmarkDirectory, 'results/latest.json')
   };
   const names = {
@@ -56,6 +58,10 @@ function parseArgs(argv) {
     const argument = argv[index];
     if (argument === '--default-only') {
       options.defaultOnly = true;
+      continue;
+    }
+    if (argument === '--direct-gemm-only') {
+      options.directGemmOnly = true;
       continue;
     }
     if (argument === '--help' || argument === '-h') {
@@ -84,6 +90,10 @@ function parseArgs(argv) {
   }
   options.output = path.resolve(projectRoot, options.output);
   if (options.inputHDR) options.inputHDR = path.resolve(process.cwd(), options.inputHDR);
+  if (options.defaultOnly && options.directGemmOnly) {
+    throw new Error('--default-only and --direct-gemm-only cannot be combined');
+  }
+  if (options.directGemmOnly && !options.baseline) options.baseline = 'v0.4.0';
   return options;
 }
 
@@ -648,7 +658,36 @@ async function main() {
         '--enable-features=Vulkan,UseSkiaRenderer,WebMachineLearningNeuralNetwork'
       ]
     });
-    const variants = options.defaultOnly
+    const variants = options.directGemmOnly
+      ? [
+          {
+            label: `v0.4.0 Direct (${baselineCommit.slice(0, 7)})`,
+            bundle: 'baseline',
+            baseline: true,
+            nativeOptions: true,
+            precision: 'fp16',
+            kernel: 'direct'
+          },
+          {
+            label: 'Current Direct',
+            bundle: 'current',
+            baseline: false,
+            nativeOptions: true,
+            engine: 'auto',
+            precision: 'fp16',
+            kernel: 'direct'
+          },
+          {
+            label: 'Current Implicit GEMM',
+            bundle: 'current',
+            baseline: false,
+            nativeOptions: true,
+            engine: 'auto',
+            precision: 'fp16',
+            kernel: 'implicit-gemm'
+          }
+        ]
+      : options.defaultOnly
       ? [
           {
             label: 'Current default (auto)',
@@ -755,6 +794,7 @@ async function main() {
         inputHDR: options.inputHDR,
         inputDimensions: staticHDR ? { width: staticHDR.width, height: staticHDR.height } : null,
         defaultOnly: options.defaultOnly,
+        directGemmOnly: options.directGemmOnly,
         referenceRuntime: Boolean(options.baseline),
         model: 'rt_hdr_calb_cnrm_large.tza',
         gpuQueueCompletionIncluded: true
