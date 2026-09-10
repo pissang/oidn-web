@@ -30,6 +30,10 @@ export type NativeUNetKernelSetting = NativeUNetKernel | 'auto';
 export type NativeUNetGemmWorkgroup = readonly [4 | 8 | 16, 4 | 8];
 
 export interface NativeUNetGemmOptions {
+  /** Internal per-layer tile selection; explicit workgroup sizes remain fixed by default. */
+  tilePolicy?: 'fixed' | 'output-aligned';
+  /** Internal decoder source-branch scheduling experiment. */
+  decoderLoad?: 'per-load' | 'source-first';
   /** Internal pooling dispatch experiment for the GEMM execution path. */
   poolLayout?: 'spatial' | 'channels';
   /** Internal shared-memory padding experiment; does not change storage ABI. */
@@ -1231,13 +1235,19 @@ fn main(
   ${addressMode !== 'analytic' ? tiledAddressCacheCode(inputBlocks, true, gemm, { blocks: sourceBlocks, upsampled: upsampledSource }) : ''}
   let totalK = ${inputBlocks * 9}u;
   for (var kBase = 0u; kBase < totalK; kBase += ${tileKBlocks}u) {
-    ${addressMode !== 'analytic' ? tiledIncrementalInputCode(valueType, `
+    ${addressMode !== 'analytic' ? (gemm.decoderLoad === 'source-first' ? `
+    if (channelBlock < ${sourceBlocks[0]}u) {
+      ${tiledIncrementalInputCode(valueType, sourceRead(0, 'inputBlock'), gemm)}
+    } else {
+      ${tiledIncrementalInputCode(valueType, sourceRead(1, `inputBlock - ${sourceBlocks[0]}u`), gemm)}
+    }
+    ` : tiledIncrementalInputCode(valueType, `
         if (inputBlock < ${sourceBlocks[0]}u) {
           ${sourceRead(0, 'inputBlock')}
         } else {
           ${sourceRead(1, `inputBlock - ${sourceBlocks[0]}u`)}
         }
-    `, gemm) : /* wgsl */ `
+    `, gemm)) : /* wgsl */ `
     for (
       var loadIndex = localLinear;
       loadIndex < ${inputTileValues}u;
@@ -1599,6 +1609,7 @@ export class NativeUNetExecutor {
   readonly subgroupsAvailable: boolean;
 
   private _model: UNetModelGraph;
+  private _gemmByOutputBlocks = new Map<number, Readonly<Required<NativeUNetGemmOptions>>>();
   private _packedConvs = new Map<string, PackedConvBuffers>();
   private _pipelineCache: Map<string, GPUComputePipeline>;
   private _pipelinePromises: Map<string, Promise<GPUComputePipeline>>;
@@ -1627,6 +1638,8 @@ export class NativeUNetExecutor {
     this.kernelSetting = options.kernel ?? 'auto';
     const workgroupSize = options.gemm?.workgroupSize ?? [8, 8];
     this.gemm = Object.freeze({
+      tilePolicy: options.gemm?.tilePolicy ?? (options.gemm?.workgroupSize ? 'fixed' : 'output-aligned'),
+      decoderLoad: options.gemm?.decoderLoad ?? 'per-load',
       poolLayout: options.gemm?.poolLayout ?? 'channels',
       sharedLayout: options.gemm?.sharedLayout ?? (this.precision === 'fp16' ? 'padded-input' : 'padded'),
       accumulationOrder: options.gemm?.accumulationOrder ?? 'k-major',
@@ -1637,6 +1650,12 @@ export class NativeUNetExecutor {
       rowsPerThread: options.gemm?.rowsPerThread ?? 8,
       workgroupSize: Object.freeze([workgroupSize[0], workgroupSize[1]]) as NativeUNetGemmWorkgroup
     });
+    if (!['fixed', 'output-aligned'].includes(this.gemm.tilePolicy)) {
+      throw new Error(`Unsupported GEMM tile policy: ${this.gemm.tilePolicy}`);
+    }
+    if (!['per-load', 'source-first'].includes(this.gemm.decoderLoad)) {
+      throw new Error(`Unsupported GEMM decoder load: ${this.gemm.decoderLoad}`);
+    }
     if (!['spatial', 'channels'].includes(this.gemm.poolLayout)) {
       throw new Error(`Unsupported GEMM pool layout: ${this.gemm.poolLayout}`);
     }
@@ -1807,15 +1826,16 @@ export class NativeUNetExecutor {
       const outputBlocks = blocksForChannels(
         this._model.convChannels.get(node.id)!.outputChannels
       );
+      const gemm = this._gemmForOutput(outputBlocks);
       const kernel = this._selectConvKernel(inputBlocks, isFinal);
-      const cacheFinalWeights = this.gemm.finalLayer === 'shared-input-weights' ||
-        (this.gemm.finalLayer === 'shared-auto' &&
+      const cacheFinalWeights = gemm.finalLayer === 'shared-input-weights' ||
+        (gemm.finalLayer === 'shared-auto' &&
           finalRgbSharedMemoryBytes(this.precision, inputBlocks, true) <=
             this._device.limits.maxComputeWorkgroupStorageSize);
       if (
         isFinal && this._model.convChannels.get(node.id)!.outputChannels === 3 &&
         (this.kernelSetting === 'auto' || this.kernelSetting === 'implicit-gemm') &&
-        this.gemm.finalLayer !== 'direct' &&
+        gemm.finalLayer !== 'direct' &&
         this._device.limits.maxComputeWorkgroupSizeX >= 8 &&
         this._device.limits.maxComputeWorkgroupSizeY >= 8 &&
         this._device.limits.maxComputeInvocationsPerWorkgroup >= 64 &&
@@ -1833,8 +1853,8 @@ export class NativeUNetExecutor {
         `${outputPrecision}/${node.activation}/` +
         `in${inputBlocks}/out${outputBlocks}` +
         (kernel === 'implicit-gemm'
-          ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}/shared-${this.gemm.sharedLayout}/acc-${this.gemm.accumulationOrder}`
+          ? `/address-${gemm.addressMode}/weights-${gemm.weightLayout}-v1` +
+            `/tile-${gemm.workgroupSize.join('x')}-r${gemm.rowsPerThread}/loads-${gemm.loadMode}/shared-${gemm.sharedLayout}/acc-${gemm.accumulationOrder}`
           : '');
       return {
         key,
@@ -1846,7 +1866,7 @@ export class NativeUNetExecutor {
               node.activation,
               inputBlocks,
               outputBlocks,
-              this.gemm
+              gemm
             )
           : kernel === 'spatial'
             ? createSpatialConvShader(
@@ -1928,13 +1948,14 @@ export class NativeUNetExecutor {
       const outputBlocks = blocksForChannels(
         this._model.convChannels.get(node.conv.id)!.outputChannels
       );
+      const gemm = this._gemmForOutput(outputBlocks);
       const key =
         `decoder-${kernel}/${this.precision}/${outputPrecision}/` +
         `${node.conv.activation}/` +
         `${sourceBlocks.join('+')}/out${outputBlocks}/up${upsampledSource}` +
         (kernel === 'implicit-gemm'
-          ? `/address-${this.gemm.addressMode}/weights-${this.gemm.weightLayout}-v1` +
-            `/tile-${this.gemm.workgroupSize.join('x')}-r${this.gemm.rowsPerThread}/loads-${this.gemm.loadMode}/shared-${this.gemm.sharedLayout}/acc-${this.gemm.accumulationOrder}`
+          ? `/address-${gemm.addressMode}/weights-${gemm.weightLayout}-v1` +
+            `/tile-${gemm.workgroupSize.join('x')}-r${gemm.rowsPerThread}/loads-${gemm.loadMode}/shared-${gemm.sharedLayout}/acc-${gemm.accumulationOrder}/decoder-${gemm.decoderLoad}`
           : '');
       return {
         key,
@@ -1947,7 +1968,7 @@ export class NativeUNetExecutor {
               sourceBlocks,
               upsampledSource,
               outputBlocks,
-              this.gemm
+              gemm
             )
           : kernel === 'spatial'
             ? createSpatialDecoderShader(
@@ -1971,6 +1992,31 @@ export class NativeUNetExecutor {
     throw new Error(
       `Native OIDN does not implement unfused ${node.op} node ${node.id}`
     );
+  }
+
+  // Wider output tiles reuse each input load across twice as many channels.
+  // Require full output blocks and keep the validated base tile as fallback.
+  private _gemmForOutput(outputBlocks: number): Readonly<Required<NativeUNetGemmOptions>> {
+    if (this.gemm.tilePolicy !== 'output-aligned' ||
+        this.gemm.workgroupSize[0] !== 8 || outputBlocks <= 0 || outputBlocks % 16 !== 0) {
+      return this.gemm;
+    }
+    const cached = this._gemmByOutputBlocks.get(outputBlocks);
+    if (cached) return cached;
+    const candidate = Object.freeze({
+      ...this.gemm,
+      workgroupSize: Object.freeze([16, this.gemm.workgroupSize[1]]) as NativeUNetGemmWorkgroup
+    });
+    const tile = gemmTile(candidate);
+    const sizes = gemmSharedSizes(candidate);
+    const limits = this._device.limits;
+    const fits = tile.workgroupX <= limits.maxComputeWorkgroupSizeX &&
+      tile.workgroupY <= limits.maxComputeWorkgroupSizeY &&
+      tile.workgroupX * tile.workgroupY <= limits.maxComputeInvocationsPerWorkgroup &&
+      (sizes.input + sizes.weights) * 4 * (this.precision === 'fp16' ? 2 : 4) <= limits.maxComputeWorkgroupStorageSize;
+    const selected = fits ? candidate : this.gemm;
+    this._gemmByOutputBlocks.set(outputBlocks, selected);
+    return selected;
   }
 
   private _coalescedPool() {
@@ -2409,7 +2455,7 @@ export class NativeUNetExecutor {
           Math.ceil(groupsX / maxGroups)
         );
       } else if (execution.nodeKernels[index] === 'implicit-gemm') {
-        const tile = gemmTile(this.gemm);
+        const tile = gemmTile(this._gemmForOutput(blocksForChannels(outputShape.channels)));
         pass.dispatchWorkgroups(
           Math.ceil(
             (outputShape.width * outputShape.height) / tile.tileM

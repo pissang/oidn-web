@@ -181,6 +181,58 @@ function wideFinalModel(dataType = 'Float16') {
   return validateUNetModel(tensors, spec);
 }
 
+function adaptiveTileModel(dataType = 'Float16') {
+  const spec = {
+    schemaVersion: 1,
+    id: 'native-gemm-adaptive-tile-test',
+    family: 'native-gemm-adaptive-tile-test',
+    input: 'input',
+    output: 'output',
+    receptiveField: 3,
+    nodes: [
+      { op: 'conv2d', id: 'hidden', input: 'input', weight: 'hidden.weight', bias: 'hidden.bias', activation: 'relu', padding: 'same' },
+      { op: 'conv2d', id: 'output', input: 'hidden', weight: 'output.weight', bias: 'output.bias', activation: 'identity', padding: 'same' }
+    ]
+  };
+  const tensors = new Map([
+    ['hidden.weight', tensor([64, 3, 3, 3], 'oihw', dataType, Array(64 * 3 * 3 * 3).fill(1))],
+    ['hidden.bias', tensor([64], 'x', dataType, Array(64).fill(0))],
+    ['output.weight', tensor([3, 64, 3, 3], 'oihw', dataType, Array(3 * 64 * 3 * 3).fill(1))],
+    ['output.bias', tensor([3], 'x', dataType, [1, 2, 3])]
+  ]);
+  return validateUNetModel(tensors, spec);
+}
+
+function fusedIntermediateDecoderModel(dataType = 'Float16') {
+  const spec = {
+    schemaVersion: 1,
+    id: 'native-gemm-fused-intermediate-test',
+    family: 'native-gemm-fused-intermediate-test',
+    input: 'input',
+    output: 'output',
+    receptiveField: 7,
+    nodes: [
+      { op: 'conv2d', id: 'branch', input: 'input', weight: 'branch.weight', bias: 'branch.bias', activation: 'relu', padding: 'same' },
+      { op: 'upsample2d', id: 'up', input: 'branch', scale: 2, mode: 'nearest' },
+      { op: 'conv2d', id: 'skip', input: 'input', weight: 'skip.weight', bias: 'skip.bias', activation: 'relu', padding: 'same' },
+      { op: 'concat', id: 'join', inputs: ['up', 'skip'], axis: 'channels' },
+      { op: 'conv2d', id: 'decoder', input: 'join', weight: 'decoder.weight', bias: 'decoder.bias', activation: 'relu', padding: 'same' },
+      { op: 'conv2d', id: 'output', input: 'decoder', weight: 'output.weight', bias: 'output.bias', activation: 'identity', padding: 'same' }
+    ]
+  };
+  const tensors = new Map([
+    ['branch.weight', tensor([4, 3, 3, 3], 'oihw', dataType, Array(4 * 3 * 3 * 3).fill(0))],
+    ['branch.bias', tensor([4], 'x', dataType, [0, 0, 0, 0])],
+    ['skip.weight', tensor([4, 3, 3, 3], 'oihw', dataType, Array(4 * 3 * 3 * 3).fill(0))],
+    ['skip.bias', tensor([4], 'x', dataType, [0, 0, 0, 0])],
+    ['decoder.weight', tensor([16, 8, 3, 3], 'oihw', dataType, Array(16 * 8 * 3 * 3).fill(0))],
+    ['decoder.bias', tensor([16], 'x', dataType, Array(16).fill(0))],
+    ['output.weight', tensor([3, 16, 3, 3], 'oihw', dataType, Array(3 * 16 * 3 * 3).fill(0))],
+    ['output.bias', tensor([3], 'x', dataType, [1, 2, 3])]
+  ]);
+  return validateUNetModel(tensors, spec);
+}
+
 function tensor(dims, layout, dataType, values) {
   const desc = new TensorDesc();
   desc.dims = [...dims];
@@ -386,12 +438,14 @@ test('freezes normalized GEMM configuration without mutating caller input', asyn
       { precision: 'fp32', kernel: 'implicit-gemm', gemm: input }
     );
     assert.deepEqual(executor.gemm, {
+      decoderLoad: 'per-load',
       poolLayout: 'channels',
       sharedLayout: 'padded',
       accumulationOrder: 'k-major',
       finalLayer: 'shared-auto',
       loadMode: 'native',
       addressMode: 'incremental',
+      tilePolicy: 'fixed',
       weightLayout: 'k-major',
       rowsPerThread: 2,
       workgroupSize: [4, 8]
@@ -412,16 +466,156 @@ test('freezes normalized GEMM configuration without mutating caller input', asyn
   });
 });
 
+test('output-aligned tiles widen only eligible output-block groups and cache the resolved choice', async () => {
+  await withGpuUsage(async () => {
+    const device = fakeDevice();
+    const executor = new NativeUNetExecutor(
+      device,
+      adaptiveTileModel(),
+      executorOptions('fp16', 'k-major', {
+        tilePolicy: 'output-aligned',
+        rowsPerThread: 8
+      })
+    );
+    assert.equal(executor.gemm.tilePolicy, 'output-aligned');
+    assert.deepEqual(executor._gemmForOutput(8).workgroupSize, [8, 8]);
+    assert.deepEqual(executor._gemmForOutput(16).workgroupSize, [16, 8]);
+    assert.strictEqual(executor._gemmForOutput(16), executor._gemmForOutput(16));
+    assert.deepEqual(executor._gemmForOutput(24).workgroupSize, [8, 8]);
+    assert.deepEqual(executor._gemmForOutput(32).workgroupSize, [16, 8]);
+
+    await executor.prepare();
+    assert.ok(device.pipelineLabels.some((label) =>
+      label.includes('conv-implicit-gemm/fp16/fp16/relu/in1/out16') &&
+      label.includes('/tile-16x8-r8/')
+    ));
+    executor.execute([new FakeBuffer(16 * 16 * 16)], 16, 16);
+    // Input pack, widened hidden GEMM, then the final direct convolution.
+    assert.deepEqual(device.dispatches.at(-2), [4, 1, 1]);
+    executor.dispose();
+  });
+});
+
+test('GEMM tile policy defaults to adaptive only when workgroup size is omitted', async () => {
+  await withGpuUsage(() => {
+    const adaptive = new NativeUNetExecutor(
+      fakeDevice(),
+      adaptiveTileModel(),
+      { precision: 'fp16', kernel: 'implicit-gemm' }
+    );
+    assert.equal(adaptive.gemm.tilePolicy, 'output-aligned');
+    assert.deepEqual(adaptive.gemm.workgroupSize, [8, 8]);
+    assert.deepEqual(adaptive._gemmForOutput(16).workgroupSize, [16, 8]);
+    adaptive.dispose();
+
+    const explicitFixed = new NativeUNetExecutor(
+      fakeDevice(),
+      adaptiveTileModel(),
+      {
+        precision: 'fp16',
+        kernel: 'implicit-gemm',
+        gemm: { workgroupSize: [8, 8] }
+      }
+    );
+    assert.equal(explicitFixed.gemm.tilePolicy, 'fixed');
+    assert.deepEqual(explicitFixed._gemmForOutput(16).workgroupSize, [8, 8]);
+    explicitFixed.dispose();
+
+    const explicitAdaptive = new NativeUNetExecutor(
+      fakeDevice(),
+      adaptiveTileModel(),
+      {
+        precision: 'fp16',
+        kernel: 'implicit-gemm',
+        gemm: { workgroupSize: [8, 8], tilePolicy: 'output-aligned' }
+      }
+    );
+    assert.equal(explicitAdaptive.gemm.tilePolicy, 'output-aligned');
+    assert.deepEqual(explicitAdaptive._gemmForOutput(16).workgroupSize, [16, 8]);
+    explicitAdaptive.dispose();
+  });
+});
+
+test('output-aligned tile falls back when the widened workgroup exceeds device limits', async () => {
+  await withGpuUsage(() => {
+    const model = adaptiveTileModel();
+    const workgroupLimited = new NativeUNetExecutor(
+      fakeDevice(),
+      model,
+      executorOptions('fp16', 'k-major', {
+        tilePolicy: 'output-aligned',
+        rowsPerThread: 8,
+        workgroupSize: [8, 8]
+      })
+    );
+    // The test fake permits 256 invocations, so make the candidate fail on X.
+    workgroupLimited._device.limits.maxComputeWorkgroupSizeX = 8;
+    assert.deepEqual(workgroupLimited._gemmForOutput(16).workgroupSize, [8, 8]);
+    workgroupLimited.dispose();
+
+    const storageLimited = new NativeUNetExecutor(
+      fakeDevice({ maxComputeWorkgroupStorageSize: 7000 }),
+      model,
+      executorOptions('fp16', 'k-major', {
+        tilePolicy: 'output-aligned',
+        rowsPerThread: 8
+      })
+    );
+    assert.deepEqual(storageLimited._gemmForOutput(16).workgroupSize, [8, 8]);
+    storageLimited.dispose();
+  });
+});
+
+test('decoder load mode is normalized and specializes the source branch in the pipeline key and shader', async () => {
+  await withGpuUsage(async () => {
+    const perLoadDevice = fakeDevice();
+    const perLoad = new NativeUNetExecutor(
+      perLoadDevice,
+      fusedIntermediateDecoderModel(),
+      executorOptions('fp16', 'k-major', { addressMode: 'incremental' })
+    );
+    assert.equal(perLoad.gemm.decoderLoad, 'per-load');
+    await perLoad.prepare();
+    assert.ok(perLoadDevice.pipelineLabels.some((label) =>
+      label.includes('decoder-implicit-gemm') && label.includes('/decoder-per-load')
+    ));
+
+    const sourceFirstDevice = fakeDevice();
+    const sourceFirst = new NativeUNetExecutor(
+      sourceFirstDevice,
+      fusedIntermediateDecoderModel(),
+      executorOptions('fp16', 'k-major', {
+        addressMode: 'incremental',
+        decoderLoad: 'source-first'
+      })
+    );
+    assert.equal(sourceFirst.gemm.decoderLoad, 'source-first');
+    await sourceFirst.prepare();
+    const shaderIndex = sourceFirstDevice.shaderLabels.findIndex((label) =>
+      label.includes('decoder-implicit-gemm') && label.includes('/decoder-source-first')
+    );
+    assert.notEqual(shaderIndex, -1);
+    assert.match(sourceFirstDevice.shaderCodes[shaderIndex], /channelBlock\s*<\s*1u/);
+    assert.ok(!sourceFirstDevice.pipelineLabels.some((label) =>
+      label.includes('/decoder-per-load')
+    ));
+    perLoad.dispose();
+    sourceFirst.dispose();
+  });
+});
+
 test('rejects unsupported GEMM address, layout, register, workgroup, and storage settings', async () => {
   await withGpuUsage(() => {
     const model = testModel('Float32').model;
     for (const gemm of [
+      { decoderLoad: 'bad' },
       { poolLayout: 'bad' },
       { sharedLayout: 'bad' },
       { accumulationOrder: 'bad' },
       { addressMode: 'bad' },
       { loadMode: 'bad' },
       { finalLayer: 'bad' },
+      { tilePolicy: 'bad' },
       { weightLayout: 'bad' },
       { rowsPerThread: 3 },
       { workgroupSize: [2, 8] },
