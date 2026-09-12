@@ -351,7 +351,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
           maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup
         }
       });
-      const adapterInfo = adapter.info ?? await adapter.requestAdapterInfo?.() ?? {};
+      const adapterInfo = adapter.info ?? {};
       const oidn = await import(config.moduleUrl);
       const initStartedAt = performance.now();
       const runtimeOptions = {
@@ -369,7 +369,7 @@ async function benchmarkVariant(browser, origin, options, variant) {
       try {
         unet = await oidn.initUNetFromURL(
           config.modelUrl,
-          { device, adapterInfo },
+          { device },
           runtimeOptions
         );
       } catch (error) {

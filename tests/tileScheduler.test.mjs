@@ -3,8 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   DynamicTileController,
-  fitTileDimension,
-  waitForSubmittedGPUWork
+  fitTileDimension
 } from '../lib/tileScheduler.js';
 
 test('starts conservatively and respects the hard maximum', () => {
@@ -64,33 +63,4 @@ test('supports custom adaptive limits and timing targets', () => {
   controller.observe([8]);
   controller.observe([8]);
   assert.equal(controller.tileSize, 512);
-});
-
-test('waits for submitted GPU work before continuing', async () => {
-  let release;
-  let completed = false;
-  const pendingGPUWork = new Promise((resolve) => {
-    release = resolve;
-  });
-  const queue = {
-    onSubmittedWorkDone: () => pendingGPUWork
-  };
-
-  const wait = waitForSubmittedGPUWork(queue).then(() => {
-    completed = true;
-  });
-  await Promise.resolve();
-  assert.equal(completed, false);
-
-  release();
-  await wait;
-  assert.equal(completed, true);
-});
-
-test('does not strand scheduling when the GPU wait rejects', async () => {
-  await assert.doesNotReject(() =>
-    waitForSubmittedGPUWork({
-      onSubmittedWorkDone: () => Promise.reject(new Error('device lost'))
-    })
-  );
 });

@@ -11,8 +11,7 @@ import {
   type DynamicTileSetting,
   planTileGrid,
   type PlannedTile,
-  OIDN_TILE_ALIGNMENT,
-  waitForSubmittedGPUWork
+  OIDN_TILE_ALIGNMENT
 } from './tileScheduler';
 import {
   detectUNetModelSpec,
@@ -50,10 +49,6 @@ interface GPUImageDataOutput {
 export interface UNetExecutionStats {
   width: number;
   height: number;
-  /** Largest output region width retained for backward compatibility. */
-  tileWidth: number;
-  /** Largest output region height retained for backward compatibility. */
-  tileHeight: number;
   tileCount: number;
   tileColumns: number;
   tileRows: number;
@@ -80,7 +75,7 @@ function isGPUImageData(
 }
 
 class UNet {
-  private _device: GPUDevice | undefined;
+  private _device: GPUDevice;
 
   private _aux;
   private _hdr;
@@ -97,7 +92,7 @@ class UNet {
 
   constructor(
     hostTensors: Map<string, HostTensor>,
-    backend: { device: GPUDevice; adapterInfo: GPUAdapterInfo },
+    device: GPUDevice,
     opts: {
       /**
        * If use auxiliary data.
@@ -109,9 +104,9 @@ class UNet {
       hdr?: boolean;
       maxTileSize?: number;
       dynamicTile?: DynamicTileSetting;
-      /** Reserved for explicit native WGSL selection. */
+      /** Native WGSL or the experimental WebNN backend. */
       engine?: UNetEngineSetting;
-      /** Arithmetic/storage precision used by the native WGSL engine. */
+      /** Arithmetic/storage precision used by the native WGSL executor. */
       precision?: NativeUNetPrecisionSetting;
       /** Model-independent convolution kernel selection. */
       kernel?: NativeUNetKernelSetting;
@@ -141,7 +136,7 @@ class UNet {
       opts.dynamicTile
     );
 
-    this._device = backend.device;
+    this._device = device;
     if (this._engine === 'webnn') {
       this._webNNExecutor = new WebNNUNetExecutor(
         this._device,
@@ -394,7 +389,7 @@ class UNet {
     let nativeOutputBuffer: GPUBuffer | undefined;
     let denoisedData: Float32Array | undefined;
     let inputScale = 1;
-    const device = this._device!;
+    const device = this._device;
     let dataProcessGPU = this._dataProcessGPU;
 
     if (inputData instanceof Float32Array) {
@@ -657,8 +652,6 @@ class UNet {
           this._lastExecution = {
             width,
             height,
-            tileWidth: plan.maxOutputWidth,
-            tileHeight: plan.maxOutputHeight,
             tileCount: plan.tiles.length,
             tileColumns: plan.columns,
             tileRows: plan.rows,
@@ -688,7 +681,8 @@ class UNet {
       // requestAnimationFrame only throttles JavaScript submission. Waiting
       // for the queue here keeps at most one OIDN tile in flight, so aborting
       // cannot leave a long tail of already-submitted GPU work.
-      void waitForSubmittedGPUWork(this._device!.queue).then(
+      void this._device.queue.onSubmittedWorkDone().then(
+        continueAfterGPUWork,
         continueAfterGPUWork
       );
     };

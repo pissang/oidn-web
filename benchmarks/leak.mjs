@@ -152,7 +152,7 @@ async function main() {
           device.pushErrorScope('validation');
           const unet = await module.initUNetFromBuffer(
             model.slice(0),
-            { device, adapterInfo },
+            { device },
             {
               aux: false,
               hdr: true,

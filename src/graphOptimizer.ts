@@ -112,8 +112,7 @@ export function optimizeModelGraph(
       if (concat?.op !== 'concat' || concat.inputs.length !== 2) continue;
       if (onlyConsumer(consumers, concat.id, 'conv2d') !== node) continue;
       // The native blocked layout can remove concat only when the source
-      // boundary is also a vec4 boundary. Other graphs keep the generic ops
-      // and can use the compatibility engine until a scalar-tail kernel exists.
+      // boundary is also a vec4 boundary. Other graphs keep the generic ops.
       const firstInputChannels = validated.channelsByValue.get(concat.inputs[0]);
       if (firstInputChannels === undefined || firstInputChannels % 4 !== 0) {
         continue;

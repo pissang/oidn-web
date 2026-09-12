@@ -124,9 +124,8 @@ If you already have a WebGPU path tracer. You can integrate the oidn-web into yo
 initUNetFromURL(
   './weights/rt_hdr_alb_nrm.tza',
   {
-    // Share GPUDevice and GPUAdapterInfo with the native WGSL runtime.
-    device,
-    adapterInfo
+    // Share the GPUDevice with the native WGSL runtime.
+    device
   },
   {
     aux: true,
@@ -180,7 +179,7 @@ const device = await adapter.requestDevice({ requiredFeatures });
 
 const unet = await initUNetFromURL(
   modelUrl,
-  { device, adapterInfo },
+  { device },
   {
     aux: true,
     hdr: true,

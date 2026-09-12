@@ -2534,7 +2534,7 @@ export class NativeUNetExecutor {
     return execution.valueBuffers.get(execution.plan.spec.output)!;
   }
 
-  /** Compatibility path for ImageData/HDR arrays without TensorFlow.js. */
+  /** Executes interleaved CPU image data through the native GPU runtime. */
   async executeCPU(
     interleavedInput: Float32Array,
     width: number,

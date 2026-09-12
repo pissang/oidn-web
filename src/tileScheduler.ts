@@ -328,15 +328,3 @@ export class DynamicTileController {
     return true;
   }
 }
-
-/** Waits for all work submitted before this call and tolerates device loss. */
-export async function waitForSubmittedGPUWork(
-  queue: Pick<GPUQueue, 'onSubmittedWorkDone'>
-) {
-  try {
-    await queue.onSubmittedWorkDone();
-  } catch {
-    // tileExecute has no error callback. Preserve its completion/cancellation
-    // behavior and let the owning GPUDevice report device loss separately.
-  }
-}

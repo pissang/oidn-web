@@ -32,18 +32,5 @@ export async function initWebGPUBackend() {
     maxComputeInvocationsPerWorkgroup:
       adapterLimits.maxComputeInvocationsPerWorkgroup
   };
-  const device = await adapter.requestDevice(deviceDescriptor);
-  const adapterInfo =
-    // requestAdapterInfo is deprecated
-    // @ts-ignore
-    adapter.info ?? (await adapter.requestAdapterInfo?.());
-
-  return initWebGPUBackendWithDevice(device, adapterInfo);
-}
-
-export async function initWebGPUBackendWithDevice(
-  device: GPUDevice,
-  adapterInfo: GPUAdapterInfo
-) {
-  return { device, adapterInfo };
+  return adapter.requestDevice(deviceDescriptor);
 }
