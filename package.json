@@ -9,7 +9,7 @@
     "build": "vite build",
     "dev": "vite dev",
     "watch": "vite build -w",
-    "test": "npm run build:lib && node --test tests/*.test.mjs",
+    "test": "npm run build:lib && npm run build && node --test tests/*.test.mjs",
     "test:leak": "node benchmarks/leak.mjs",
     "benchmark": "node benchmarks/compare.mjs",
     "model:inspect": "npm run build:lib && node scripts/inspect-model.mjs",

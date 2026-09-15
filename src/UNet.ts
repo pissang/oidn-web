@@ -485,7 +485,8 @@ class UNet {
     denoiseAlpha,
     tileOverlap,
     wholeImage,
-    scheduling = 'animation-frame'
+    scheduling = 'event-loop',
+    error
   }: {
     color: T;
     albedo?: ImageData | GPUImageData;
@@ -503,14 +504,18 @@ class UNet {
     tileOverlap?: number;
     /** How JavaScript yields between completed GPU tiles. */
     scheduling?: 'animation-frame' | 'event-loop';
-    done: (outputData: T extends GPUImageData ? GPUImageDataOutput : T) => void;
+    done: (
+      outputData: T extends GPUImageData ? GPUImageDataOutput : T
+    ) => void | Promise<void>;
+    /** Receives asynchronous execution, queue, and callback failures. */
+    error?: (reason: unknown) => void | Promise<void>;
     progress?: (
       outputData: T extends GPUImageData ? GPUImageDataOutput : T,
       tileData: (T extends GPUImageData ? GPUImageDataOutput : T) | undefined,
       tile: Tile,
       currentIdx: number,
       totalIdx: number
-    ) => void;
+    ) => void | Promise<void>;
   }): () => void {
     if (this._aux && (!albedo || !normal)) {
       throw new Error('Normal map and albedo map are both required');
@@ -570,25 +575,66 @@ class UNet {
       ? undefined
       : makeImageData(width, height);
 
-    let aborted = false;
+    type ExecutionState = 'active' | 'aborted' | 'settled';
+    let state: ExecutionState = 'active';
+    let scheduledTimer: ReturnType<typeof setTimeout> | undefined;
+    let scheduledAnimationFrame: number | undefined;
 
     const now = () =>
       typeof performance === 'undefined' ? Date.now() : performance.now();
     const executionStartTime = now();
     const tileTimesMs: number[] = [];
+    const cancelScheduledTile = () => {
+      if (scheduledTimer !== undefined) {
+        clearTimeout(scheduledTimer);
+        scheduledTimer = undefined;
+      }
+      if (
+        scheduledAnimationFrame !== undefined &&
+        typeof cancelAnimationFrame !== 'undefined'
+      ) {
+        cancelAnimationFrame(scheduledAnimationFrame);
+        scheduledAnimationFrame = undefined;
+      }
+    };
+    const reportCallbackFailure = (reason: unknown) => {
+      // An error callback is the terminal observer and cannot report its own
+      // failure through the same channel. Keep that failure handled.
+      console.error('OIDN error callback failed', reason);
+    };
+    const settleError = (reason: unknown) => {
+      if (state !== 'active') return;
+      state = 'settled';
+      cancelScheduledTile();
+      if (error) {
+        try {
+          void Promise.resolve(error(reason)).catch(reportCallbackFailure);
+        } catch (callbackReason) {
+          reportCallbackFailure(callbackReason);
+        }
+      } else {
+        console.error('OIDN execution failed', reason);
+      }
+    };
     const scheduleNextTile = (callback: () => void) => {
       if (
         scheduling === 'event-loop' ||
         typeof requestAnimationFrame === 'undefined'
       ) {
-        setTimeout(callback, 0);
+        scheduledTimer = setTimeout(() => {
+          scheduledTimer = undefined;
+          callback();
+        }, 0);
       } else {
-        requestAnimationFrame(callback);
+        scheduledAnimationFrame = requestAnimationFrame(() => {
+          scheduledAnimationFrame = undefined;
+          callback();
+        });
       }
     };
 
     const executeTile = async (tileIndex: number) => {
-      if (aborted) {
+      if (state !== 'active') {
         return;
       }
       const tile = plan.tiles[tileIndex];
@@ -613,35 +659,40 @@ class UNet {
         hdr,
         denoiseAlpha
       );
-      if (aborted) return;
+      if (state !== 'active') return;
       const output = outputImageData || {
         data: resGPUBuffer,
         width,
         height
       };
-      progress?.(
-        output as any,
-        // Is undefined if using webgpu buffer
-        outputTileData as any,
-        new Tile(
-          tile.output.x,
-          tile.output.y,
-          tile.output.width,
-          tile.output.height
-        ),
-        tileIndex,
-        plan.tiles.length
-      );
+      if (progress) {
+        await progress(
+          output as any,
+          // Is undefined if using webgpu buffer
+          outputTileData as any,
+          new Tile(
+            tile.output.x,
+            tile.output.y,
+            tile.output.width,
+            tile.output.height
+          ),
+          tileIndex,
+          plan.tiles.length
+        );
+      }
+      if (state !== 'active') return;
 
       const hasNextTile = tileIndex + 1 < plan.tiles.length;
-      const continueAfterGPUWork = () => {
+      await this._device.queue.onSubmittedWorkDone();
+      if (state !== 'active') return;
+      const continueAfterGPUWork = async () => {
         tileTimesMs.push(now() - tileStartTime);
-        if (aborted) return;
+        if (state !== 'active') return;
 
         if (hasNextTile) {
           scheduleNextTile(() => {
-            if (aborted) return;
-            executeTile(tileIndex + 1);
+            if (state !== 'active') return;
+            void executeTile(tileIndex + 1).catch(settleError);
           });
         } else {
           const sortedTileTimes = [...tileTimesMs].sort((a, b) => a - b);
@@ -674,23 +725,28 @@ class UNet {
             this._dynamicTileController.observe(tileTimesMs);
           }
           // console.log(memory());
-          done(output as any);
+          await done(output as any);
+          if (state === 'active') state = 'settled';
         }
       };
-
-      // requestAnimationFrame only throttles JavaScript submission. Waiting
-      // for the queue here keeps at most one OIDN tile in flight, so aborting
-      // cannot leave a long tail of already-submitted GPU work.
-      void this._device.queue.onSubmittedWorkDone().then(
-        continueAfterGPUWork,
-        continueAfterGPUWork
-      );
+      await continueAfterGPUWork();
     };
 
-    executeTile(0);
+    const deviceLost = (this._device as GPUDevice & {
+      lost?: Promise<GPUDeviceLostInfo>;
+    }).lost;
+    if (deviceLost) {
+      void deviceLost.then(
+        (info) => settleError(new Error(`WebGPU device lost: ${info.message}`)),
+        settleError
+      );
+    }
+    void executeTile(0).catch(settleError);
 
     return () => {
-      aborted = true;
+      if (state !== 'active') return;
+      state = 'aborted';
+      cancelScheduledTile();
     };
   }
 
