@@ -89,6 +89,10 @@ class UNet {
 
   private _dynamicTileController: DynamicTileController;
   private _lastExecution?: UNetExecutionStats;
+  private _activeExecutionFailures = new Set<(reason: unknown) => void>();
+  private _deviceLostObserved = false;
+  private _deviceLostSettled = false;
+  private _deviceLostReason: unknown;
 
   constructor(
     hostTensors: Map<string, HostTensor>,
@@ -137,6 +141,7 @@ class UNet {
     );
 
     this._device = device;
+    this._observeDeviceLoss();
     if (this._engine === 'webnn') {
       this._webNNExecutor = new WebNNUNetExecutor(
         this._device,
@@ -238,8 +243,42 @@ class UNet {
         maxTileSize: this._dynamicTileController.maxTileSize,
         targetTileTimeMs: this._dynamicTileController.targetTileTimeMs
       },
-      lastExecution: this._lastExecution
+      lastExecution: this._lastExecution,
+      activeExecutionCount: this._activeExecutionFailures.size
     };
+  }
+
+  private _observeDeviceLoss() {
+    // Object.create-based embedders/tests can bypass field initializers.
+    this._activeExecutionFailures ??= new Set();
+    if (this._deviceLostObserved) return;
+    this._deviceLostObserved = true;
+    const deviceLost = (this._device as GPUDevice & {
+      lost?: Promise<GPUDeviceLostInfo>;
+    }).lost;
+    if (!deviceLost) return;
+    const failAll = (reason: unknown) => {
+      if (this._deviceLostSettled) return;
+      this._deviceLostSettled = true;
+      this._deviceLostReason = reason;
+      const active = [...this._activeExecutionFailures];
+      this._activeExecutionFailures.clear();
+      for (const fail of active) fail(reason);
+    };
+    void deviceLost.then(
+      (info) => failAll(new Error(`WebGPU device lost: ${info.message}`)),
+      failAll
+    );
+  }
+
+  private _registerExecutionFailure(fail: (reason: unknown) => void) {
+    this._observeDeviceLoss();
+    this._activeExecutionFailures.add(fail);
+    if (this._deviceLostSettled) {
+      this._activeExecutionFailures.delete(fail);
+      queueMicrotask(() => fail(this._deviceLostReason));
+    }
+    return () => this._activeExecutionFailures.delete(fail);
   }
 
   /** Captures per-node GPU timestamps for the next native tile execution. */
@@ -579,6 +618,7 @@ class UNet {
     let state: ExecutionState = 'active';
     let scheduledTimer: ReturnType<typeof setTimeout> | undefined;
     let scheduledAnimationFrame: number | undefined;
+    let unregisterDeviceLoss = () => false;
 
     const now = () =>
       typeof performance === 'undefined' ? Date.now() : performance.now();
@@ -606,6 +646,7 @@ class UNet {
       if (state !== 'active') return;
       state = 'settled';
       cancelScheduledTile();
+      unregisterDeviceLoss();
       if (error) {
         try {
           void Promise.resolve(error(reason)).catch(reportCallbackFailure);
@@ -725,28 +766,27 @@ class UNet {
             this._dynamicTileController.observe(tileTimesMs);
           }
           // console.log(memory());
+          // GPU inference is complete; device loss can no longer affect this
+          // execution. Deregister before the user callback resolves so a
+          // completed execution never remains retained by the device watcher.
+          unregisterDeviceLoss();
           await done(output as any);
-          if (state === 'active') state = 'settled';
+          if (state === 'active') {
+            state = 'settled';
+          }
         }
       };
       await continueAfterGPUWork();
     };
 
-    const deviceLost = (this._device as GPUDevice & {
-      lost?: Promise<GPUDeviceLostInfo>;
-    }).lost;
-    if (deviceLost) {
-      void deviceLost.then(
-        (info) => settleError(new Error(`WebGPU device lost: ${info.message}`)),
-        settleError
-      );
-    }
+    unregisterDeviceLoss = this._registerExecutionFailure(settleError);
     void executeTile(0).catch(settleError);
 
     return () => {
       if (state !== 'active') return;
       state = 'aborted';
       cancelScheduledTile();
+      unregisterDeviceLoss();
     };
   }
 

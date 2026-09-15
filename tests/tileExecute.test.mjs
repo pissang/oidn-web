@@ -148,3 +148,45 @@ test('reports device loss once while a tile is in flight', async () => {
   assert.match(String(result.reason), /adapter reset/);
   inFlight.resolve();
 });
+
+test('uses one device-loss observer and releases completed execution closures', async () => {
+  const lost = deferred();
+  let observerCount = 0;
+  const observedLost = {
+    then(onFulfilled, onRejected) {
+      observerCount++;
+      return lost.promise.then(onFulfilled, onRejected);
+    }
+  };
+  const unet = createUNet(async () => {}, async () => {}, observedLost);
+
+  for (let execution = 0; execution < 4; execution++) {
+    assert.equal((await run(unet)).type, 'done');
+    assert.equal(unet._activeExecutionFailures.size, 0);
+  }
+  assert.equal(observerCount, 1);
+
+  const failure = new Error('later execution failed');
+  unet._executeTile = async () => { throw failure; };
+  const failed = await run(unet);
+  assert.equal(failed.type, 'error');
+  assert.equal(failed.reason, failure);
+  assert.equal(unet._activeExecutionFailures.size, 0);
+  assert.equal(observerCount, 1);
+
+  const inFlight = deferred();
+  unet._executeTile = () => inFlight.promise;
+  const abort = unet.tileExecute({
+    color: new ImageData(16, 16),
+    done: () => assert.fail('cancelled execution completed'),
+    error: () => assert.fail('cancelled execution failed')
+  });
+  assert.equal(unet._activeExecutionFailures.size, 1);
+  abort();
+  assert.equal(unet._activeExecutionFailures.size, 0);
+  assert.equal(observerCount, 1);
+  inFlight.resolve();
+  lost.resolve({ message: 'loss after every execution settled' });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(unet._activeExecutionFailures.size, 0);
+});
