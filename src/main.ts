@@ -9,6 +9,7 @@ import type {
   NativeUNetKernelSetting,
   NativeUNetPrecisionSetting
 } from './nativeUNet';
+import type { HDRTransfer } from './process';
 
 export { parseTZA, UNet };
 export { planTileGrid } from './tileScheduler';
@@ -58,6 +59,8 @@ export type {
 export interface UNetOptions {
   aux?: boolean;
   hdr?: boolean;
+  /** HDR transfer function expected by the trained model. Defaults to PU. */
+  hdrTransfer?: HDRTransfer;
   /** Hard upper bound for an output tile edge. Defaults to 512. */
   maxTileSize?: number;
   /** Adaptive GPU-time-based tile sizing. Enabled by default. */
@@ -75,6 +78,7 @@ export interface UNetOptions {
 }
 
 export type { UNetEngineSetting, UNetExecutionStats } from './UNet';
+export type { HDRTransfer } from './process';
 export { WebNNUNetExecutor } from './webnnUNet';
 export type { WebNNRuntimeSupport, WebNNUNetOptions } from './webnnUNet';
 export type {

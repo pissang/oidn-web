@@ -89,6 +89,22 @@ initUNetFromURL('./weights/rt_hdr.tza', undefined, {
 });
 ```
 
+HDR transfer defaults to the PU curve used by the regular RT models. Models
+trained for the RTLightmap filter use the logarithmic curve from upstream OIDN;
+select it explicitly when loading such weights:
+
+```ts
+const lightmap = await initUNetFromURL('./weights/rtlightmap_hdr.tza', undefined, {
+  hdr: true,
+  hdrTransfer: 'log'
+});
+```
+
+The `log` transfer maps `y` to `log(1 + y) / log(65505)` and reverses this
+before writing HDR output. For GPU-buffer inputs, callers may continue to
+pre-scale the complete image once and leave the runtime's `inputScale` at its
+existing default of `1`.
+
 ### Use auxiliary images
 
 ```ts

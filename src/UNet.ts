@@ -4,7 +4,8 @@ import {
   Tile,
   avgLogLum,
   hdrTransferFuncCPU,
-  hdrTransferFuncInverseCPU
+  hdrTransferFuncInverseCPU,
+  type HDRTransfer
 } from './process';
 import {
   DynamicTileController,
@@ -79,6 +80,7 @@ class UNet {
 
   private _aux;
   private _hdr;
+  private _hdrTransfer: HDRTransfer;
 
   private _dataProcessGPU?: GPUDataProcess;
   private _nativeExecutor?: NativeUNetExecutor;
@@ -106,6 +108,8 @@ class UNet {
        * If input is HDR image.
        */
       hdr?: boolean;
+      /** HDR transfer function expected by the trained model. */
+      hdrTransfer?: HDRTransfer;
       maxTileSize?: number;
       dynamicTile?: DynamicTileSetting;
       /** Native WGSL or the experimental WebNN backend. */
@@ -121,6 +125,7 @@ class UNet {
   ) {
     this._aux = opts.aux || false;
     this._hdr = opts.hdr || false;
+    this._hdrTransfer = opts.hdrTransfer ?? 'pu';
     this._engine = opts.engine ?? 'auto';
     const modelSpec = opts.modelSpec ?? detectUNetModelSpec(hostTensors);
     const validatedModel = validateUNetModel(hostTensors, modelSpec);
@@ -236,6 +241,7 @@ class UNet {
       model: this._modelSpec.id,
       modelFamily: this._modelSpec.family,
       inputChannels: this._inputChannels,
+      hdrTransfer: this._hdrTransfer,
       dynamicTile: {
         enabled: this._dynamicTileController.enabled,
         currentTileSize: this._dynamicTileController.tileSize,
@@ -441,7 +447,8 @@ class UNet {
         tileData = hdrTransferFuncCPU({
           data: tileData,
           channels,
-          inputScale
+          inputScale,
+          transfer: this._hdrTransfer
         });
       }
       denoisedData = await (this._webNNExecutor ?? this._nativeExecutor!).executeCPU(
@@ -453,7 +460,8 @@ class UNet {
       if (!dataProcessGPU) {
         dataProcessGPU = this._dataProcessGPU = new GPUDataProcess(
           device,
-          isHDR
+          isHDR,
+          this._hdrTransfer
         );
       }
       dataProcessGPU.setImageSize(width, height);
@@ -483,7 +491,8 @@ class UNet {
         denoisedData = hdrTransferFuncInverseCPU({
           data: denoisedData!,
           channels: 3,
-          inputScale
+          inputScale,
+          transfer: this._hdrTransfer
         });
       }
 

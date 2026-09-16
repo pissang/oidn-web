@@ -1,4 +1,11 @@
 import { WGPUComputePass } from './WGPUComputePass';
+import {
+  hdrTransferFuncCPU,
+  hdrTransferFuncInverseCPU,
+  type HDRTransfer
+} from './hdrTransfer';
+export { hdrTransferFuncCPU, hdrTransferFuncInverseCPU } from './hdrTransfer';
+export type { HDRTransfer } from './hdrTransfer';
 
 const a = 1.41283765e3;
 const b = 1.64593172;
@@ -37,6 +44,8 @@ const yMax = 65504;
 const xMax = PUForward(yMax);
 const normScale = 1 / xMax;
 const rcpNormScale = xMax;
+const logXMax = Math.log(yMax + 1);
+const logNormScale = 1 / logXMax;
 
 export class Tile {
   constructor(
@@ -75,53 +84,6 @@ export function avgLogLum({
   return key / Math.pow(2, averageLuminance);
 }
 
-export function hdrTransferFuncCPU({
-  data,
-  channels,
-  inputScale
-}: {
-  data: Float32Array;
-  channels: number;
-  inputScale: number;
-}) {
-  const newData = new Float32Array(data.length);
-  newData.set(data);
-  // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/core/color.h#L71
-  for (let i = 0; i < newData.length; i += channels) {
-    // First three are color
-    for (let c = 0; c < 3; c++) {
-      let y = newData[i + c] * inputScale;
-      // https://github.com/RenderKit/oidn/blob/713ec7838ba650f99e0a896549c0dca5eeb3652d/devices/cpu/color.ispc#L135
-      newData[i + c] = PUForward(y) * normScale;
-    }
-  }
-
-  return newData;
-}
-
-export function hdrTransferFuncInverseCPU({
-  data,
-  channels,
-  inputScale
-}: {
-  data: Float32Array;
-  channels: number;
-  inputScale: number;
-}) {
-  const newData = new Float32Array(data.length);
-  newData.set(data);
-
-  const outputScale = 1 / inputScale;
-  for (let i = 0; i < newData.length; i += channels) {
-    for (let c = 0; c < 3; c++) {
-      let x = newData[i + c] * rcpNormScale;
-      newData[i + c] = PUInverse(x) * outputScale;
-    }
-  }
-
-  return newData;
-}
-
 const constsCode = `
 const a = ${a};
 const b = ${b};
@@ -147,7 +109,11 @@ export class GPUDataProcess {
 
   private _isInputTexture?: boolean;
 
-  constructor(private _device: GPUDevice, private _isHDR: boolean) {
+  constructor(
+    private _device: GPUDevice,
+    private _isHDR: boolean,
+    private _hdrTransfer: HDRTransfer = 'pu'
+  ) {
     const commonUniforms = [
       {
         label: 'inputScale',
@@ -261,17 +227,26 @@ out_color[outIdx] = textureLoad(in_color, globalId.xy, 0);
 
     this._isInputTexture = isInputTexture;
     const isHDR = this._isHDR;
+    const hdrForwardCode = this._hdrTransfer === 'log'
+      ? `fn HDRForward(y: f32) -> f32 { return log(y + 1.0) * logNormScale; }`
+      : `fn HDRForward(y: f32) -> f32 {
+  if (y <= y0) { return a * y * normScale; }
+  else if (y <= y1) { return (b * pow(y, c) + d) * normScale; }
+  else { return (e * log(y + f) + g) * normScale; }
+}`;
+    const hdrInverseCode = this._hdrTransfer === 'log'
+      ? `fn HDRInverse(x: f32) -> f32 { return exp(x * logXMax) - 1.0; }`
+      : `fn HDRInverse(x: f32) -> f32 {
+  let y = x * rcpNormScale;
+  if (y <= x0) { return y / a; }
+  else if (y <= x1) { return pow((y - d) / b, 1 / c); }
+  else { return exp((y - g) / e) - f; }
+}`;
     const commonCSDefine = /* wgsl */ `
 ${constsCode}
-fn PUForward(y: f32) -> f32 {
-  if (y <= y0) {
-    return a * y;
-  } else if (y <= y1) {
-    return b * pow(y, c) + d;
-  } else {
-    return e * log(y + f) + g;
-  }
-}`;
+const logXMax = ${logXMax};
+const logNormScale = ${logNormScale};
+${hdrForwardCode}`;
     function readInputCode(inputName: string) {
       return isInputTexture
         ? `textureLoad(in_${inputName}, globalId.xy + vec2u(inputOffset), 0)`
@@ -290,7 +265,7 @@ if (${denoiseAlpha}) {
   out_color[outIdx] = vec3f(1.0 - col.a);
 }
 else if (${isHDR}) {
-  out_color[outIdx] = vec3f(PUForward(col.r * inputScale), PUForward(col.g * inputScale), PUForward(col.b * inputScale)) * normScale;
+  out_color[outIdx] = vec3f(HDRForward(col.r * inputScale), HDRForward(col.g * inputScale), HDRForward(col.b * inputScale));
 }
 else {
   out_color[outIdx] = col.rgb;
@@ -316,15 +291,8 @@ ${commonCSMain}
     this._outputPass.setCSCode({
       csDefine: /* wgsl */ `
 ${constsCode}
-fn PUInverse(y: f32) -> f32 {
-  if (y <= x0) {
-    return y / a;
-  } else if (y <= x1) {
-    return pow((y - d) / b, 1 / c);
-  } else {
-    return exp((y - g) / e) - f;
-  }
-}
+const logXMax = ${logXMax};
+${hdrInverseCode}
 `,
       csMain: /* wgsl */ `
 let x = i32(globalId.x);
@@ -346,7 +314,7 @@ if (${denoiseAlpha}) {
 }
 else if (${isHDR}) {
   out_color[outIdx] = vec4f(
-    vec3f(PUInverse(col.r * rcpNormScale), PUInverse(col.g * rcpNormScale), PUInverse(col.b * rcpNormScale)) / inputScale,
+    vec3f(HDRInverse(col.r), HDRInverse(col.g), HDRInverse(col.b)) / inputScale,
     // Pick the alpha
     raw.a
   );
