@@ -353,9 +353,12 @@ class UNet {
     const tileData = new Float32Array(
       srcTile.width * srcTile.height * channels
     );
+    const height = data.length / (width * channels);
     for (let y = 0; y < srcTile.height; y++) {
       for (let x = 0; x < srcTile.width; x++) {
-        const i2 = ((y + srcTile.y) * width + (x + srcTile.x)) * channels;
+        const sourceX = Math.min(width - 1, x + srcTile.x);
+        const sourceY = Math.min(height - 1, y + srcTile.y);
+        const i2 = (sourceY * width + sourceX) * channels;
         const i1 = (y * srcTile.width + x) * channels;
 
         for (let c = 0; c < channels; c++) {

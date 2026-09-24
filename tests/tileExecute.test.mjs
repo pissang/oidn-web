@@ -56,6 +56,34 @@ function run(unet, overrides = {}) {
   });
 }
 
+test('replicates the image edge into padded model input tiles', () => {
+  const unet = Object.create(UNet.prototype);
+  const width = 300;
+  const height = 300;
+  const channels = 3;
+  const source = new Float32Array(width * height * channels);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * channels;
+      source[offset] = x;
+      source[offset + 1] = y;
+      source[offset + 2] = x + y;
+    }
+  }
+
+  const padded = unet._readTile(source, channels,
+    { x: 0, y: 0, width: 304, height: 304 }, width);
+  const pixel = (x, y) => {
+    const offset = (y * 304 + x) * channels;
+    return Array.from(padded.subarray(offset, offset + channels));
+  };
+
+  assert.deepEqual(pixel(299, 299), [299, 299, 598]);
+  assert.deepEqual(pixel(303, 299), [299, 299, 598]);
+  assert.deepEqual(pixel(299, 303), [299, 299, 598]);
+  assert.deepEqual(pixel(303, 303), [299, 299, 598]);
+});
+
 test('reports first and later asynchronous tile failures exactly once', async () => {
   const firstFailure = new Error('first tile failed');
   const first = await run(createUNet(async () => { throw firstFailure; }));

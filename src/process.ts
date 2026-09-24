@@ -249,13 +249,18 @@ const logNormScale = ${logNormScale};
 ${hdrForwardCode}`;
     function readInputCode(inputName: string) {
       return isInputTexture
-        ? `textureLoad(in_${inputName}, globalId.xy + vec2u(inputOffset), 0)`
+        ? `textureLoad(in_${inputName}, vec2u(inputPosition), 0)`
         : `in_${inputName}[inIdx]`;
     }
     const commonCSMain = /* wgsl */ `
 let x = i32(globalId.x);
 let y = i32(globalId.y);
-let inIdx = (y + inputOffset.y) * inputSize.x + (x + inputOffset.x);
+let inputPosition = clamp(
+  vec2i(x, y) + inputOffset,
+  vec2i(0),
+  inputSize - vec2i(1)
+);
+let inIdx = inputPosition.y * inputSize.x + inputPosition.x;
 let col = ${readInputCode('color')};
 
 let outIdx = y * outputSize.x + x;

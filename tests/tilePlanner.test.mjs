@@ -8,8 +8,6 @@ function assertExactCoverage(plan, width, height) {
   for (const tile of plan.tiles) {
     const { input, output } = tile;
     assert.ok(input.x >= 0 && input.y >= 0);
-    assert.ok(input.x + input.width <= width);
-    assert.ok(input.y + input.height <= height);
     assert.ok(output.x >= input.x && output.y >= input.y);
     assert.ok(output.x + output.width <= input.x + input.width);
     assert.ok(output.y + output.height <= input.y + input.height);
@@ -83,6 +81,33 @@ test('keeps tiled model input shapes aligned for uneven image dimensions', () =>
     assert.equal(tile.input.height % 16, 0);
   }
   assertExactCoverage(plan, 1300, 721);
+});
+
+test('pads unaligned single-tile inputs by extending the outer image edges', () => {
+  for (const [width, height] of [[300, 300], [7, 9]]) {
+    const plan = planTileGrid(width, height, 432, 80);
+
+    assert.equal(plan.tiles.length, 1);
+    const { input, output } = plan.tiles[0];
+    assert.equal(input.width % 16, 0);
+    assert.equal(input.height % 16, 0);
+    assert.equal(output.x, 0);
+    assert.equal(output.y, 0);
+    assert.equal(output.width, width);
+    assert.equal(output.height, height);
+    assert.ok(input.x + input.width >= width);
+    assert.ok(input.y + input.height >= height);
+    assertExactCoverage(plan, width, height);
+  }
+});
+
+test('keeps aligned single and multi-tile dimensions unchanged', () => {
+  for (const size of [320, 600]) {
+    const plan = planTileGrid(size, size, 432, 80);
+    assert.ok(plan.tiles.every(({ input }) =>
+      input.width % 16 === 0 && input.height % 16 === 0));
+    assertExactCoverage(plan, size, size);
+  }
 });
 
 test('buckets common 1080p boundary shapes without exceeding the cache', () => {

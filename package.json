@@ -13,6 +13,7 @@
     "test:leak": "node benchmarks/leak.mjs",
     "benchmark": "node benchmarks/compare.mjs",
     "model:inspect": "npm run build:lib && node scripts/inspect-model.mjs",
+    "prepare": "npm run build:lib",
     "prepublishOnly": "npm run build && npm run build:lib",
     "build:lib": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc",
     "watch:lib": "tsc --watch"

@@ -63,15 +63,15 @@ function alignRangeWithinImage(
   minimumSize = 0
 ) {
   const currentSize = end - start;
-  const alignedSize = Math.min(
-    imageSize,
-    Math.max(
-      minimumSize,
-      alignUp(currentSize, OIDN_TILE_ALIGNMENT)
-    )
+  const alignedSize = Math.max(
+    minimumSize,
+    alignUp(currentSize, OIDN_TILE_ALIGNMENT)
   );
   let alignedStart = start - Math.floor((alignedSize - currentSize) / 2);
-  alignedStart = clamp(alignedStart, 0, imageSize - alignedSize);
+  // At an image edge, keep the padded portion on the right/bottom. Input
+  // readers replicate the nearest image edge into that portion, while output
+  // tiles remain strictly inside the original image.
+  alignedStart = clamp(alignedStart, 0, Math.max(0, imageSize - alignedSize));
   return { start: alignedStart, end: alignedStart + alignedSize };
 }
 
