@@ -118,6 +118,64 @@ test('uses event-loop scheduling by default even when RAF never delivers', async
   }
 });
 
+async function withRAF(requestAnimationFrame, body) {
+  const originalRAF = globalThis.requestAnimationFrame;
+  const originalCancelRAF = globalThis.cancelAnimationFrame;
+  const cancelled = [];
+  globalThis.requestAnimationFrame = requestAnimationFrame;
+  globalThis.cancelAnimationFrame = (id) => cancelled.push(id);
+  try {
+    return await body(cancelled);
+  } finally {
+    if (originalRAF === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = originalRAF;
+    if (originalCancelRAF === undefined) delete globalThis.cancelAnimationFrame;
+    else globalThis.cancelAnimationFrame = originalCancelRAF;
+  }
+}
+
+test('animation-frame scheduling advances tiles on display frames', async () => {
+  let rafCalls = 0;
+  await withRAF((callback) => {
+    rafCalls++;
+    queueMicrotask(callback);
+    return rafCalls;
+  }, async () => {
+    const result = await run(createUNet(async () => {}), {
+      scheduling: 'animation-frame'
+    });
+    assert.equal(result.type, 'done');
+    assert.equal(rafCalls, 1);
+  });
+});
+
+test('animation-frame scheduling completes when RAF never delivers', async () => {
+  let rafCalls = 0;
+  await withRAF(() => ++rafCalls, async (cancelled) => {
+    const result = await run(createUNet(async () => {}), {
+      scheduling: 'animation-frame'
+    });
+    assert.equal(result.type, 'done');
+    assert.equal(rafCalls, 1);
+    assert.deepEqual(cancelled, [1]);
+  });
+});
+
+test('wholeImage executes an unaligned image as a single tile', async () => {
+  const tiles = [];
+  const unet = createUNet(async (_input, _tileData, _output, tile) => {
+    tiles.push(tile);
+  });
+  unet._processImageData = () => new Float32Array(40 * 24 * 3);
+  const result = await run(unet, {
+    color: new ImageData(40, 24),
+    wholeImage: true
+  });
+  assert.equal(result.type, 'done');
+  assert.equal(tiles.length, 1);
+  assert.deepEqual(tiles[0].output, { x: 0, y: 0, width: 40, height: 24 });
+});
+
 test('routes queue and callback failures through the error callback', async () => {
   const queueFailure = new Error('queue failed');
   const queue = await run(createUNet(

@@ -29,6 +29,9 @@ import { WebNNUNetExecutor } from './webnnUNet';
 
 export type UNetEngineSetting = 'auto' | 'wgsl' | 'webnn';
 
+/** Upper bound on waiting for a display frame between tiles. */
+const ANIMATION_FRAME_FALLBACK_MS = 100;
+
 interface HDRImageData {
   data: Float32Array;
   width: number;
@@ -196,7 +199,7 @@ class UNet {
   async prepareForImage(
     width: number,
     height: number,
-    options: { tileOverlap?: number } = {}
+    options: { tileOverlap?: number; wholeImage?: boolean } = {}
   ) {
     const defaultTileOverlap = roundUp(
       this._modelSpec.receptiveField / 2,
@@ -208,7 +211,9 @@ class UNet {
     const plan = planTileGrid(
       width,
       height,
-      this._dynamicTileController.tileSize,
+      options.wholeImage
+        ? roundUp(Math.max(width, height), OIDN_TILE_ALIGNMENT)
+        : this._dynamicTileController.tileSize,
       resolvedTileOverlap
     );
     const shapes = [...new Map(
@@ -546,14 +551,22 @@ class UNet {
      * If denoise alpha channel. Otherwise denoise RGB channels.
      */
     denoiseAlpha?: boolean;
-    /** Execute the complete input image as one tile when it fits GPU limits. */
+    /**
+     * Execute the complete input image as one tile, ignoring `maxTileSize`.
+     * The image must fit the device's buffer and dispatch limits.
+     */
     wholeImage?: boolean;
     /**
      * Per-side context for boundaries shared with another tile. Defaults to
      * half of the model receptive field rounded up to 16 pixels.
      */
     tileOverlap?: number;
-    /** How JavaScript yields between completed GPU tiles. */
+    /**
+     * How JavaScript yields between completed GPU tiles. `event-loop`
+     * (default) continues on the next macrotask. `animation-frame` waits for
+     * the next display frame, bounded by a short timer so hidden pages still
+     * complete.
+     */
     scheduling?: 'animation-frame' | 'event-loop';
     done: (
       outputData: T extends GPUImageData ? GPUImageDataOutput : T
@@ -581,8 +594,9 @@ class UNet {
     const width = color.width;
     const height = color.height;
     const adaptiveTileSize = this._dynamicTileController.tileSize;
+    // The planner aligns the maximum down, so round up to keep one tile.
     const requestedTileSize = wholeImage
-      ? Math.max(width, height)
+      ? roundUp(Math.max(width, height), OIDN_TILE_ALIGNMENT)
       : adaptiveTileSize;
     const defaultTileOverlap = roundUp(
       this._modelSpec.receptiveField / 2,
@@ -679,10 +693,15 @@ class UNet {
           callback();
         }, 0);
       } else {
-        scheduledAnimationFrame = requestAnimationFrame(() => {
-          scheduledAnimationFrame = undefined;
+        // Hidden documents pause requestAnimationFrame. Race it against a
+        // timer so animation-frame scheduling still completes in background
+        // tabs, minimized windows, and offscreen iframes.
+        const run = () => {
+          cancelScheduledTile();
           callback();
-        });
+        };
+        scheduledAnimationFrame = requestAnimationFrame(run);
+        scheduledTimer = setTimeout(run, ANIMATION_FRAME_FALLBACK_MS);
       }
     };
 
@@ -777,7 +796,6 @@ class UNet {
           if (shouldAdaptTileSize) {
             this._dynamicTileController.observe(tileTimesMs);
           }
-          // console.log(memory());
           // GPU inference is complete; device loss can no longer affect this
           // execution. Deregister before the user callback resolves so a
           // completed execution never remains retained by the device watcher.

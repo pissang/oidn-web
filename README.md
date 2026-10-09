@@ -245,19 +245,33 @@ npm run model:inspect -- weights/rt_hdr_alb_nrm.tza
 ```
 
 ```ts
-const unet = await initUNetFromURL(newModelUrl, backend, {
+const unet = await initUNetFromURL(newModelUrl, undefined, {
   aux: true,
   hdr: true,
   modelSpec: newOidnModelSpec
 });
 ```
 
-### GPU backpressure and dynamic tiles
+### GPU backpressure, scheduling, and dynamic tiles
 
 `tileExecute` waits for the submitted GPU work of a tile before scheduling the
 next tile. This keeps at most one OIDN tile in flight, which makes cancellation
 responsive instead of leaving queued denoising work ahead of interactive
 rendering.
+
+Between tiles, JavaScript yields according to `scheduling`:
+
+- `'event-loop'` (default) continues on the next macrotask. Execution finishes
+  as soon as the GPU allows and also completes in background tabs.
+- `'animation-frame'` waits for the next display frame, so at most one tile
+  runs per frame. Use it when OIDN shares the GPU with an interactive renderer
+  and frame rate matters more than denoise latency. If no frame arrives within
+  100 ms (for example in a hidden tab), the next tile runs anyway.
+
+Asynchronous failures, including WebGPU device loss and exceptions thrown by
+`progress` or `done`, are reported to the optional `error` callback. Unless the
+returned abort function is called first, every execution ends by calling `done`
+or `error`; without an `error` callback, failures are logged to the console.
 
 Tile sizing is adaptive by default. `maxTileSize` is a hard upper bound. Each
 execution partitions the image into balanced rectangular output regions and
@@ -270,7 +284,7 @@ complete executions. The default range starts at 432 pixels, does not go below
 256, changes in 16-pixel steps, and targets about 16 ms of GPU work per tile.
 
 ```ts
-initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
+const unet = await initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true,
   hdr: true,
   maxTileSize: 512,
@@ -281,28 +295,45 @@ initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
   }
 });
 
-// A latency-oriented caller can use a smaller halo and avoid waiting for a
-// display-frame boundary between completed tiles. The default overlap remains
-// half of the model receptive field rounded up to 16 pixels.
-unet.tileExecute({
+// An interactive renderer can pace tiles to display frames. A smaller halo
+// lowers per-tile cost; the default overlap is half of the model receptive
+// field rounded up to 16 pixels.
+const abortDenoising = unet.tileExecute({
   color,
   albedo,
   normal,
   tileOverlap: 80,
-  scheduling: 'event-loop',
+  scheduling: 'animation-frame',
   done(denoised) {
     // ...
+  },
+  error(reason) {
+    console.error(reason);
   }
 });
 
 // Restore fixed-size behavior when deterministic tiling is preferred.
-initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', backend, {
+initUNetFromURL('./weights/rt_hdr_alb_nrm.tza', undefined, {
   aux: true,
   hdr: true,
   maxTileSize: 512,
   dynamicTile: false
 });
 ```
+
+### Warm up and whole-image execution
+
+The native runtime creates per-shape GPU buffers and pipelines the first time
+it sees a tile input shape. Call `prepareForImage` with the expected image size while a loading
+state is still visible, so the first `tileExecute` does not stall:
+
+```ts
+await unet.prepareForImage(width, height);
+```
+
+Pass `wholeImage: true` to `tileExecute` (and to `prepareForImage`) to run the
+complete image as one tile and skip tiling overhead. It ignores `maxTileSize`,
+so the image must fit the device's buffer and dispatch limits.
 
 ### Benchmark the native runtime against TFJS
 

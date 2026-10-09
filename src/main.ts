@@ -71,7 +71,11 @@ export interface UNetOptions {
   precision?: NativeUNetPrecisionSetting;
   /** `auto` uses implicit GEMM for FP16/FP32 convolutions, except the direct output layer. */
   kernel?: NativeUNetKernelSetting;
-  /** Optional implicit-GEMM tuning for native WGSL execution. */
+  /**
+   * Experimental implicit-GEMM tuning for native WGSL execution. These knobs
+   * exist for benchmarking and may change or be removed in any release.
+   * @experimental
+   */
   gemm?: NativeUNetGemmOptions;
   /** Versioned topology descriptor for future/custom OIDN TZA models. */
   modelSpec?: UNetModelSpec;

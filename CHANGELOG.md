@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0] - 2026-10-09
+
+oidn-web 0.5.0 simplifies device setup, makes tiled execution always settle, and switches FP16 convolutions to implicit GEMM. It contains breaking changes for TypeScript callers that pass `adapterInfo`, for code that constructs `UNet` directly, and for code that relies on square tiles or per-frame tile pacing.
+
+### Breaking changes
+
+- `initUNetFromURL` and `initUNetFromBuffer` take `{ device }` as the second argument. `adapterInfo` was only needed by the removed TensorFlow.js backend and is no longer accepted by the type. Extra properties are ignored at runtime, but TypeScript rejects an object literal that still contains `adapterInfo`.
+- `new UNet(tensors, device, options)` takes a `GPUDevice` instead of a `{ device, adapterInfo }` object.
+- `tileExecute` now continues on the event loop between tiles by default instead of waiting for `requestAnimationFrame`. Pass `scheduling: 'animation-frame'` to keep pacing tiles to display frames.
+- Tiles are balanced rectangles with overlap only on edges shared with another tile, instead of fixed-size squares. Tile count, position, and size reported to `progress` differ from 0.4.0. The default `dynamicTile.initialTileSize` is now 432.
+- `UNetExecutionStats` no longer has `tileWidth` and `tileHeight`. Use `tileColumns`, `tileRows`, `tileOverlap`, `inputPixelCount`, and `inputShapeCount` instead.
+- FP16 convolutions use implicit GEMM by default. Output differs slightly from 0.4.0 because accumulation order changed. Set `kernel: 'direct'` to reproduce the 0.4.0 FP16 path.
+
+### Added
+
+- `hdrTransfer: 'log'` for RTLightmap HDR models, alongside the default PU transfer.
+- `error` callback on `tileExecute` for asynchronous failures, WebGPU device loss, and exceptions thrown by `progress` or `done`. `progress` and `done` may return promises.
+- `scheduling: 'event-loop' | 'animation-frame'`, `tileOverlap`, and `wholeImage` options on `tileExecute`.
+- `prepareForImage(width, height)` to create per-shape GPU resources before the first denoise.
+- `planTileGrid` and its `TilePlan`, `PlannedTile`, and `TileRect` types.
+- Experimental `gemm` tuning options. These are intended for benchmarking and are not covered by semver.
+- `hdrTransfer` and `activeExecutionCount` in `getRuntimeInfo()`, and the active GEMM configuration under `kernel.gemm`.
+
+### Changed
+
+- Implicit GEMM tiles are selected by output alignment and GPU limits, with optimized addressing, weight layout, register tiles, shared-memory layout, and pooling access.
+- The final RGB convolution uses an adaptive shared-memory cache.
+- Adaptive tile sizing uses the smoothed P75 tile GPU time, excludes the cold first tile, ignores cancelled and single-tile work, and buckets input shapes to at most two sizes.
+- `animation-frame` scheduling falls back to a 100 ms timer so execution still completes in hidden tabs.
+
+### Fixed
+
+- Tiled execution always settles with `done` or `error`, or stops silently after abort, including when `requestAnimationFrame` never fires or the device is lost.
+- Completed executions release their device-loss listeners.
+- Edge tiles whose size is not a multiple of 16 replicate edge pixels into the padded model input.
+- The npm package no longer includes benchmark results, tests, and scripts.
+
+### Migration notes
+
+- Replace `{ device, adapterInfo }` with `{ device }`.
+- Replace `new UNet(tensors, { device, adapterInfo }, options)` with `new UNet(tensors, device, options)`.
+- Interactive renderers that share the GPU with OIDN should pass `scheduling: 'animation-frame'`.
+- Pass an `error` callback to handle failures. Without one, failures are logged to the console.
+
 ## [0.4.0] - 2026-08-20
 
 oidn-web 0.4.0 replaces the TensorFlow.js inference stack with a purpose-built, model-driven WebGPU runtime. Existing `initUNetFromURL` and `initUNetFromBuffer` integrations remain supported while gaining native FP16, adaptive scheduling, runtime diagnostics, and stronger model validation.
@@ -46,4 +90,5 @@ oidn-web 0.4.0 replaces the TensorFlow.js inference stack with a purpose-built, 
 - When supplying an existing `GPUDevice`, request `shader-f16` before creating the device if FP16 inference is desired.
 - Set `dynamicTile: false` to restore fixed-size tiling.
 
+[0.5.0]: https://github.com/pissang/oidn-web/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/pissang/oidn-web/compare/v0.3.5...v0.4.0
