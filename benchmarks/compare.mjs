@@ -165,7 +165,10 @@ function defaultChrome() {
     '/Applications/Chromium.app/Contents/MacOS/Chromium',
     '/usr/bin/google-chrome',
     '/usr/bin/chromium',
-    '/usr/bin/chromium-browser'
+    '/usr/bin/chromium-browser',
+    ...['PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'].map((name) =>
+      process.env[name] &&
+      path.join(process.env[name], 'Google/Chrome/Application/chrome.exe'))
   ].find((candidate) => candidate && existsSync(candidate));
 }
 
@@ -173,6 +176,8 @@ function run(command, args, { cwd = projectRoot, quiet = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
+      // npm is a .cmd shim on Windows, which spawn can only start via a shell.
+      shell: process.platform === 'win32' && command === 'npm',
       stdio: quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit'
     });
     let stdout = '';
@@ -655,7 +660,7 @@ async function main() {
       headless: true,
       args: [
         '--enable-unsafe-webgpu',
-        '--enable-features=Vulkan,UseSkiaRenderer,WebMachineLearningNeuralNetwork'
+        '--enable-features=UseSkiaRenderer,WebMachineLearningNeuralNetwork'
       ]
     });
     const variants = options.directGemmOnly

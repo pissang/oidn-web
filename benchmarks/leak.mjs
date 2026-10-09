@@ -111,7 +111,7 @@ async function main() {
         '--enable-unsafe-webgpu',
         '--enable-precise-memory-info',
         '--js-flags=--expose-gc',
-        '--enable-features=Vulkan,UseSkiaRenderer,WebMachineLearningNeuralNetwork'
+        '--enable-features=UseSkiaRenderer,WebMachineLearningNeuralNetwork'
       ]
     });
     const page = await browser.newPage();

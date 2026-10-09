@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file.
 
 oidn-web 0.5.0 simplifies device setup, makes tiled execution always settle, and switches FP16 convolutions to implicit GEMM. It contains breaking changes for TypeScript callers that pass `adapterInfo`, for code that constructs `UNet` directly, and for code that relies on square tiles or per-frame tile pacing.
 
+### Performance
+
+Measured with `npm run benchmark -- --direct-gemm-only` on an Apple GPU in headless Chrome, using the Clean Aux Large model with FP16. Performance depends on the browser, GPU, model, and tile size. Devices without `shader-f16` use FP32, which already used implicit GEMM in 0.4.0, so their gains are expected to be smaller.
+
+| Input | 0.4.0 median | 0.5.0 median | Speedup |
+| --- | ---: | ---: | ---: |
+| 512 x 512, one tile | 27.2 ms | 19.1 ms | 1.42x |
+| 1920 x 1080, 512 px tiles (12 tiles) | 742 ms | 369 ms | 2.01x |
+
+- Implicit GEMM reduces the network GPU time of a 512 x 512 tile from 26.8 ms to 18.5 ms.
+- Overlap only on shared tile edges reduces the input each tile computes. With the direct kernel alone, the 1920 x 1080 case is 1.47x faster than 0.4.0.
+
 ### Breaking changes
 
 - `initUNetFromURL` and `initUNetFromBuffer` take `{ device }` as the second argument. `adapterInfo` was only needed by the removed TensorFlow.js backend and is no longer accepted by the type. Extra properties are ignored at runtime, but TypeScript rejects an object literal that still contains `adapterInfo`.
