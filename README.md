@@ -30,7 +30,7 @@ shader compilation does not interrupt an interactive denoise.
 
 [Basic Example](https://oidn-web-example.vercel.app/) ([Code](https://github.com/pissang/oidn-web-example/blob/main/src/main.js))
 
-[Use with three-gpu-pathtracer](https://oidn-web-example.vercel.app/three-gpu-pathtracer.html) ([Code](https://github.com/pissang/oidn-web-example/blob/main/src/three-gpu-pathtracer.js))
+[Use with three-gpu-pathtracer](https://github.com/gkjohnson/three-gpu-pathtracer/blob/main/src/webgpu/API.md#oidndenoiser)
 
 ### Install
 
